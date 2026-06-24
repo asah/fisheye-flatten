@@ -303,7 +303,7 @@ fn main() {
 
 
     let out_w = ((cx_out * 2.0 * args.scale).round() as u32).max(1);
-    let out_h = ((strip_h_px as f64 * width_ratio * args.scale).round() as u32).max(1);
+    let out_h = ((strip_h_px as f64 * args.scale).round() as u32).max(1); // height is 1:1 with source strip
 
     if args.verbose {
         eprintln!("Camera:      focal {:.1}mm  crop {:.3}×  → FF-equiv {:.1}mm",
