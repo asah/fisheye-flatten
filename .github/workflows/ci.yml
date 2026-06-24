@@ -16,82 +16,73 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # windows-latest omitted: PIL test image generation uses python3
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo registry + build
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build (release)
         run: cargo build --release --locked
 
-      - name: Run unit tests
+      - name: Unit tests
         run: cargo test --release --locked
 
-      - name: Smoke test — defish the bundled test image
+      - name: Smoke — default (bp=2.0, FF, 15mm)
         run: |
-          ./target/release/defish \
-            tests/test_fisheye.jpg \
-            --output /tmp/test_out.jpg \
-            --strip-percent 0.30 \
-            --focal-length 15.0 \
-            --crop-factor 1.0 \
-            --verbose
-          # Verify output exists and is non-empty
-          test -s /tmp/test_out.jpg && echo "Output file OK"
+          ./target/release/defish tests/test_fisheye.jpg \
+            -o /tmp/out_default.jpg -p 0.30 -f 15.0 -c 1.0 -v
+          test -s /tmp/out_default.jpg
 
-      - name: Smoke test — GFX 100S II crop factor
+      - name: Smoke — GFX 100S II crop factor
         run: |
-          ./target/release/defish \
-            tests/test_fisheye.jpg \
-            --output /tmp/test_gfx.jpg \
-            --strip-percent 0.30 \
-            --focal-length 15.0 \
-            --crop-factor 0.79 \
-            --verbose
-          test -s /tmp/test_gfx.jpg && echo "GFX output file OK"
+          ./target/release/defish tests/test_fisheye.jpg \
+            -o /tmp/out_gfx.jpg -p 0.30 -f 15.0 -c 0.79 -v
+          test -s /tmp/out_gfx.jpg
 
-      - name: Smoke test — 8mm wide end
+      - name: Smoke — 8mm wide end
         run: |
-          ./target/release/defish \
-            tests/test_fisheye.jpg \
-            --output /tmp/test_8mm.jpg \
-            --strip-percent 0.20 \
-            --focal-length 8.0 \
-            --crop-factor 1.0 \
-            --verbose
-          test -s /tmp/test_8mm.jpg && echo "8mm output file OK"
+          ./target/release/defish tests/test_fisheye.jpg \
+            -o /tmp/out_8mm.jpg -p 0.20 -f 8.0 -c 1.0 -v
+          test -s /tmp/out_8mm.jpg
 
-      - name: Smoke test — different strip sizes
+      - name: Smoke — blend power sweep (center-preserving tuning)
         run: |
-          for pct in 0.10 0.20 0.30 0.50 0.80; do
-            ./target/release/defish \
-              tests/test_fisheye.jpg \
-              --output /tmp/test_strip_${pct}.jpg \
-              --strip-percent $pct \
-              --focal-length 15.0 \
-              --crop-factor 1.0
-            test -s /tmp/test_strip_${pct}.jpg && echo "Strip $pct OK"
+          for bp in 1.5 2.0 2.5 3.0; do
+            ./target/release/defish tests/test_fisheye.jpg \
+              -o /tmp/out_bp${bp}.jpg -p 0.30 -f 15.0 -c 1.0 -b $bp -e 1.0
+            test -s /tmp/out_bp${bp}.jpg && echo "bp=$bp OK"
           done
 
-      - name: Upload test outputs as artifacts
+      - name: Smoke — edge strength sweep
+        run: |
+          for es in 0.5 0.75 1.0; do
+            ./target/release/defish tests/test_fisheye.jpg \
+              -o /tmp/out_es${es}.jpg -p 0.30 -f 15.0 -c 1.0 -b 2.0 -e $es
+            test -s /tmp/out_es${es}.jpg && echo "edge_strength=$es OK"
+          done
+
+      - name: Smoke — strip percent sweep
+        run: |
+          for pct in 0.10 0.20 0.30 0.50; do
+            ./target/release/defish tests/test_fisheye.jpg \
+              -o /tmp/out_strip${pct}.jpg -p $pct -f 15.0 -c 1.0
+            test -s /tmp/out_strip${pct}.jpg && echo "strip=$pct OK"
+          done
+
+      - name: Upload test outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: defish-test-outputs-${{ matrix.os }}
-          path: /tmp/test_*.jpg
+          name: defish-outputs-${{ matrix.os }}
+          path: /tmp/out_*.jpg
           retention-days: 7
