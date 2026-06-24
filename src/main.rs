@@ -1,23 +1,23 @@
-/// defish — Laowa 8-15mm fisheye to rectilinear or cylindrical strip
+/// defish — Laowa 8-15mm fisheye: full 2D remap to cylindrical or rectilinear
 ///
-/// Two projection modes selected automatically by focal length:
+/// This is a FULL 2D remap, not a horizontal-only crop+rescale.
 ///
-///  RECTILINEAR (default, good for 10-15mm):
-///    x_out = f * tan(θ_x)
-///    Straight lines stay straight. Output wider than input (+13% at 15mm).
-///    Edge stretch = 1/cos²(θ) — grows fast, impractical beyond ~60°.
+/// For each output pixel at (azimuth az, elevation el):
+///   - Source fisheye pixel is found by computing the 3D ray direction
+///   - The ray lands at a point in the fisheye that may be OUTSIDE the
+///     naive center-strip crop, pulling in content from above/below
 ///
-///  CYLINDRICAL (default for circular/8mm fisheye):
-///    x_out = f * θ_x   (linear in angle, same as equidistant fisheye)
-///    No horizontal stretch at any angle. Output same width as source strip.
-///    Straight vertical lines stay straight. Horizontal lines bow slightly
-///    near top/bottom but this is imperceptible in a narrow horizontal strip.
+/// This is the key: a tree at 60° azimuth and 0° elevation in the output
+/// maps to a fisheye source pixel that is at radius r=60°/90°*R from center,
+/// along the horizontal. But the SAME tree's branches at 60° az, 15° el
+/// pull from r=62°/90°*R along a direction angled up-right — which is OUTSIDE
+/// a naive horizontal crop. The cylindrical remap shows the correct tree.
 ///
-///  Override with --projection rect|cyl
+/// Projections:
+///   Cylindrical:  x=f*az,   y=f*tan(el)   — uniform angular spacing, no edge stretch
+///   Rectilinear:  x=f*tan(az), y=f*tan(el) — straight lines, edge stretch near 90°
 ///
-/// Image circle auto-detection: for circular fisheye (8mm), the black border
-/// is detected and R_circle is set to the image circle radius, not the
-/// sensor half-diagonal.
+/// Auto-selected: cylindrical for circular fisheye (8mm), rectilinear for 10-15mm.
 
 use clap::Parser;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb};
@@ -41,27 +41,29 @@ impl std::str::FromStr for Projection {
 }
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "defish",
-    about = "Defish Laowa 8-15mm fisheye photos into panoramic strips",
+#[command(name = "defish",
+    about = "Full 2D defish of Laowa 8-15mm fisheye to cylindrical or rectilinear strip",
     long_about = "\
-Crops the vertical center strip of a fisheye photo and remaps it from \
-equidistant fisheye to rectilinear or cylindrical projection.\n\n\
-Projection is chosen automatically by focal length:\n  \
-  8mm  (circular fisheye) → cylindrical: no edge stretch, natural look\n  \
-  10-15mm (full-frame)    → rectilinear: straight lines, +13-46% wider\n\n\
+Full 2D fisheye → cylindrical/rectilinear remap. Unlike a simple crop, edge \
+columns pull content from outside the naive horizontal strip — e.g. a tree at \
+60° to the left shows branches that were above/below the crop line in the \
+fisheye, remapped to their correct position in the output.\n\n\
+Auto-selects projection:\n  \
+  circular fisheye (8mm, black border) → cylindrical (no edge stretch)\n  \
+  full-frame fisheye (10-15mm)         → rectilinear (straight lines)\n\n\
 Examples:\n  \
-  defish photo.jpg                       # full auto\n  \
-  defish photo.jpg -p 0.5               # 50% strip\n  \
-  defish photo.jpg --projection cyl     # force cylindrical\n  \
-  defish photo.jpg -f 8 -c 0.79        # GFX 100S II at 8mm"
+  defish photo.jpg                   # full auto\n  \
+  defish photo.jpg -p 0.5           # 50% vertical coverage of image circle\n  \
+  defish photo.jpg --projection cyl # force cylindrical\n  \
+  defish photo.jpg -f 8 -c 0.79    # GFX 100S II at 8mm"
 )]
 struct Args {
     input: PathBuf,
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Fraction of frame height to use as center strip (0..1)
-    #[arg(short = 'p', long, default_value_t = 0.30)]
+    /// Vertical coverage: fraction of image circle diameter (for circular)
+    /// or frame height (for full-frame). Controls how tall the output is.
+    #[arg(short = 'p', long, default_value_t = 0.50)]
     strip_percent: f64,
     /// Override focal length in mm (normally read from EXIF)
     #[arg(short = 'f', long)]
@@ -72,21 +74,15 @@ struct Args {
     /// Override image circle radius in pixels (auto-detected from black border)
     #[arg(short = 'r', long)]
     circle_radius: Option<f64>,
-    /// Output projection: rect (rectilinear) or cyl (cylindrical).
-    /// Auto-selected: cyl for circular fisheye (8mm), rect for full-frame.
+    /// Output projection: rect or cyl. Auto-selected from focal length.
     #[arg(long)]
     projection: Option<Projection>,
     /// Output scale multiplier
     #[arg(short = 's', long, default_value_t = 1.0)]
     scale: f64,
-    /// Print geometry details
     #[arg(short = 'v', long)]
     verbose: bool,
 }
-
-// ---------------------------------------------------------------------------
-// EXIF
-// ---------------------------------------------------------------------------
 
 fn read_exif_focal_length(path: &Path) -> Option<f64> {
     let file = File::open(path).ok()?;
@@ -116,10 +112,6 @@ fn detect_crop_factor(model: &str) -> f64 {
     else { eprintln!("Note: unrecognised camera '{}'; assuming full-frame.", model); 1.0 }
 }
 
-// ---------------------------------------------------------------------------
-// Lens: Laowa 8-15mm half diagonal AoV (FF-equivalent)
-// ---------------------------------------------------------------------------
-
 fn laowa_half_aov_deg(focal_mm_ff: f64) -> f64 {
     const TABLE: &[(f64, f64)] = &[
         (8.0, 90.0), (9.0, 77.0), (10.0, 65.0), (11.0, 57.5),
@@ -129,62 +121,39 @@ fn laowa_half_aov_deg(focal_mm_ff: f64) -> f64 {
     for i in 0..TABLE.len() - 1 {
         let (f0, a0) = TABLE[i];
         let (f1, a1) = TABLE[i + 1];
-        if fl >= f0 && fl <= f1 {
-            return a0 + (fl - f0) / (f1 - f0) * (a1 - a0);
-        }
+        if fl >= f0 && fl <= f1 { return a0 + (fl - f0) / (f1 - f0) * (a1 - a0); }
     }
     TABLE.last().unwrap().1
 }
 
-// ---------------------------------------------------------------------------
-// Image circle detection (for circular fisheye with black border)
-// ---------------------------------------------------------------------------
-
 fn detect_image_circle(img: &DynamicImage) -> (f64, bool) {
     let (w, h) = img.dimensions();
-    let cx = w as f64 / 2.0;
-    let cy = h as f64 / 2.0;
-    let max_r = cx.min(cy) as u32;
-    let half_diag = (cx * cx + cy * cy).sqrt();
-
-    const BLACK_THRESH: u8 = 20;
-    const N_ANGLES: usize = 72;
-
-    let mut radii = Vec::with_capacity(N_ANGLES);
-    for i in 0..N_ANGLES {
-        let angle = std::f64::consts::TAU * i as f64 / N_ANGLES as f64;
-        let (cos_a, sin_a) = (angle.cos(), angle.sin());
-        for r in (1..=max_r).rev() {
-            let px = (cx + r as f64 * cos_a).round() as i64;
-            let py = (cy + r as f64 * sin_a).round() as i64;
+    let cx = w as f64 / 2.0; let cy = h as f64 / 2.0;
+    let half_diag = (cx*cx + cy*cy).sqrt();
+    const BLACK: u8 = 20; const N: usize = 72;
+    let mut radii = Vec::with_capacity(N);
+    for i in 0..N {
+        let a = std::f64::consts::TAU * i as f64 / N as f64;
+        let (ca, sa) = (a.cos(), a.sin());
+        for r in (1..=(half_diag as u32)).rev() {
+            let px = (cx + r as f64 * ca).round() as i64;
+            let py = (cy + r as f64 * sa).round() as i64;
             if px < 0 || py < 0 || px >= w as i64 || py >= h as i64 { continue; }
             let p = img.get_pixel(px as u32, py as u32).0;
-            if p[0].max(p[1]).max(p[2]) > BLACK_THRESH {
-                radii.push(r as f64);
-                break;
-            }
+            if p[0].max(p[1]).max(p[2]) > BLACK { radii.push(r as f64); break; }
         }
     }
-
     if radii.is_empty() { return (cx.min(cy), false); }
-
     radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let median = radii[radii.len() / 2];
+    let med = radii[radii.len() / 2];
     let spread = radii.last().unwrap() - radii.first().unwrap();
-
-    if spread < 0.15 * median {
-        (median, true)   // tight cluster → circular fisheye
-    } else {
-        (half_diag, false) // wide spread → full-frame fisheye
-    }
+    if spread < 0.15 * med { (med, true) } else { (half_diag, false) }
 }
 
-// ---------------------------------------------------------------------------
-// Interpolation
-// ---------------------------------------------------------------------------
-
-fn bilinear(img: &DynamicImage, x: f64, y: f64) -> [u8; 3] {
+fn bilinear(img: &DynamicImage, x: f64, y: f64) -> Option<[u8; 3]> {
     let (w, h) = img.dimensions();
+    // Return None if outside image bounds (will show as black)
+    if x < 0.0 || y < 0.0 || x >= w as f64 || y >= h as f64 { return None; }
     let x0 = x.floor() as i64; let y0 = y.floor() as i64;
     let clx = |v: i64| v.clamp(0, w as i64 - 1) as u32;
     let cly = |v: i64| v.clamp(0, h as i64 - 1) as u32;
@@ -196,158 +165,166 @@ fn bilinear(img: &DynamicImage, x: f64, y: f64) -> [u8; 3] {
     let l = |a: u8, b: u8, t: f64| -> u8 {
         (a as f64 + (b as f64 - a as f64) * t).round() as u8
     };
-    [l(l(p00[0],p10[0],tx),l(p01[0],p11[0],tx),ty),
-     l(l(p00[1],p10[1],tx),l(p01[1],p11[1],tx),ty),
-     l(l(p00[2],p10[2],tx),l(p01[2],p11[2],tx),ty)]
+    Some([l(l(p00[0],p10[0],tx),l(p01[0],p11[0],tx),ty),
+          l(l(p00[1],p10[1],tx),l(p01[1],p11[1],tx),ty),
+          l(l(p00[2],p10[2],tx),l(p01[2],p11[2],tx),ty)])
 }
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 fn main() {
     let args = Args::parse();
 
     let img = image::open(&args.input).unwrap_or_else(|e| {
-        eprintln!("Cannot open '{}': {}", args.input.display(), e);
-        std::process::exit(1);
+        eprintln!("Cannot open '{}': {}", args.input.display(), e); std::process::exit(1);
     });
     let (src_w, src_h) = img.dimensions();
     let src_cx = src_w as f64 / 2.0;
     let src_cy = src_h as f64 / 2.0;
 
-    // --- Lens / sensor ---
     let focal_mm = args.focal_length
         .or_else(|| read_exif_focal_length(&args.input))
         .unwrap_or_else(|| { eprintln!("No EXIF focal length; assuming 15mm."); 15.0 });
 
     let crop_factor = args.crop_factor.unwrap_or_else(|| {
-        read_exif_model(&args.input)
-            .map(|m| detect_crop_factor(&m))
+        read_exif_model(&args.input).map(|m| detect_crop_factor(&m))
             .unwrap_or_else(|| { eprintln!("No EXIF camera model; assuming full-frame."); 1.0 })
     });
 
     let fl_ff     = focal_mm * crop_factor;
     let theta_max = laowa_half_aov_deg(fl_ff.clamp(8.0, 15.0)).to_radians();
 
-    // --- Image circle ---
     let (r_circle, is_circular) = if let Some(r) = args.circle_radius {
-        let half_diag = (src_cx*src_cx + src_cy*src_cy).sqrt();
-        (r, r < 0.9 * half_diag)
+        let hd = (src_cx*src_cx + src_cy*src_cy).sqrt();
+        (r, r < 0.9 * hd)
     } else {
         detect_image_circle(&img)
     };
 
-    // --- Projection: auto-select or use override ---
-    let proj = args.projection.unwrap_or(
+    let proj = args.projection.clone().unwrap_or(
         if is_circular { Projection::Cylindrical } else { Projection::Rectilinear }
     );
 
-    // --- Strip geometry ---
-    let strip_frac   = args.strip_percent.clamp(0.01, 1.0);
-    let max_strip_h  = if is_circular { (r_circle * 2.0) as u32 } else { src_h };
-    let strip_h_px   = (((max_strip_h as f64) * strip_frac).round() as u32).max(1);
-    let strip_y0     = (src_h - strip_h_px) / 2;
-    let strip_half_h = strip_h_px as f64 / 2.0;
+    // f_pix: pixels per radian at center (same for source and output at center)
+    // equidistant: r = theta/theta_max * R  → dr/dtheta = R/theta_max
+    let f_pix = r_circle / theta_max;
 
-    // Horizontal half-width available in the source strip
-    let strip_half_w = if is_circular {
-        // Chord half-width at the strip's vertical extent
-        (r_circle * r_circle - strip_half_h * strip_half_h).max(0.0).sqrt()
+    // Output angular coverage:
+    //   Horizontal: az_max = theta_h (the horizontal half-AoV of the lens,
+    //               limited by image circle or strip choice)
+    //   Vertical:   el_max chosen by strip_percent
+    //
+    // For circular: full circle covers ±90° in all directions.
+    //   strip_percent controls el_max: 0.5 → el_max=arctan(0.5*R / f_pix)
+    // For full-frame: strip_percent controls fraction of frame height.
+
+    // el_max: maximum elevation angle in output
+    // We choose el_max such that the output height covers strip_percent of
+    // the source image circle diameter (for circular) or frame height (full-frame)
+    let half_h_src = if is_circular { r_circle } else { src_cy };
+    // strip_percent * half_h_src gives half-height in source pixels at az=0
+    // At az=0: y_src = f_pix * sin(el) ≈ f_pix * el for small el,
+    // but exactly: for equidistant, y_src = (el / theta_max) * R = f_pix * el
+    let el_max_src_px = args.strip_percent.clamp(0.01, 0.99) * half_h_src;
+    // el_max = el_max_src_px / f_pix  (equidistant: y = f_pix * el)
+    let el_max = (el_max_src_px / f_pix).min(theta_max * 0.95);
+
+    // az_max: maximum azimuth. For circular: limited so the 3D ray stays
+    // within the image circle (theta < theta_max).
+    // At el=el_max, az_max satisfies: acos(cos(az)*cos(el_max)) < theta_max
+    // → cos(az) > cos(theta_max)/cos(el_max)
+    // → az < acos(cos(theta_max)/cos(el_max))
+    // Cap slightly below to avoid sampling outside the circle.
+    let az_max = if is_circular {
+        let cos_az_max = (theta_max * 0.98).cos() / el_max.cos();
+        if cos_az_max <= -1.0 { theta_max * 0.98 }
+        else if cos_az_max >= 1.0 { 0.0 }
+        else { cos_az_max.acos() }
     } else {
-        src_cx
+        // Full-frame: az_max from equidistant at horizontal frame edge
+        (src_cx / r_circle) * theta_max
     };
 
-    // Horizontal half-angle covered by the strip
-    // equidistant: r = θ/θ_max * R  →  θ = r/R * θ_max
-    let theta_h = (strip_half_w / r_circle) * theta_max;
-
-    // --- Output dimensions ---
-    // Cylindrical: output x = R * θ (linear in angle) → same pixel/radian as source
-    //   → output width == source strip width (no expansion)
-    // Rectilinear: output x = R/θ_max * tan(θ) → expands at edges
-    //   → cx_out = R/θ_max * tan(θ_h), always > strip_half_w
+    // Output dimensions
+    // Cylindrical:  x = f_pix * az  → out_w = 2 * f_pix * az_max
+    // Rectilinear:  x = f_pix * tan(az) → out_w = 2 * f_pix * tan(az_max)
     let cx_out = match proj {
-        Projection::Cylindrical  => strip_half_w,  // 1:1, no expansion
-        Projection::Rectilinear  => r_circle / theta_max * theta_h.tan(),
+        Projection::Cylindrical => f_pix * az_max,
+        Projection::Rectilinear => f_pix * az_max.tan(),
     };
+    // Vertical: y = f_pix * tan(el)  (both projections use perspective vertical)
+    // out_h = 2 * f_pix * tan(el_max)
+    let cy_out = f_pix * el_max.tan();
 
     let out_w = ((cx_out * 2.0 * args.scale).round() as u32).max(1);
-    // Height is 1:1 with source strip — the remap only moves pixels horizontally
-    let out_h = ((strip_h_px as f64 * args.scale).round() as u32).max(1);
+    let out_h = ((cy_out * 2.0 * args.scale).round() as u32).max(1);
 
     if args.verbose {
         eprintln!("Camera:     focal {:.1}mm  crop {:.3}×  FF-equiv {:.1}mm",
             focal_mm, crop_factor, fl_ff);
-        eprintln!("Lens:       half-AoV {:.1}°  θ_h {:.1}°",
-            theta_max.to_degrees(), theta_h.to_degrees());
+        eprintln!("Lens:       theta_max={:.1}°  f_pix={:.1}px/rad  R={:.0}px",
+            theta_max.to_degrees(), f_pix, r_circle);
         eprintln!("Circle:     R={:.0}px  {}",
-            r_circle,
-            if is_circular { "circular fisheye (black border detected)" }
-            else { "full-frame fisheye" });
-        eprintln!("Projection: {:?}  cx_out={:.0}px  ({:+.1}% vs strip)",
-            proj, cx_out, (cx_out / strip_half_w - 1.0) * 100.0);
-        eprintln!("Strip:      {:.0}%  y=[{}, {}]  h={}px  half_w={:.0}px",
-            strip_frac * 100.0, strip_y0, strip_y0 + strip_h_px,
-            strip_h_px, strip_half_w);
+            r_circle, if is_circular { "circular (black border detected)" } else { "full-frame" });
+        eprintln!("Coverage:   az±{:.1}°  el±{:.1}°",
+            az_max.to_degrees(), el_max.to_degrees());
+        eprintln!("Projection: {:?}", proj);
         eprintln!("Output:     {}×{}px", out_w, out_h);
     }
 
-    // --- Backward remap ---
+    // -------------------------------------------------------------------------
+    // Full 2D backward remap
     //
-    // For each output pixel ox at normalized position ox_norm ∈ [-1, +1]:
-    //
-    //   Cylindrical:
-    //     θ_x = ox_norm * θ_h               (linear — just unscale from output)
-    //     src_x = cx + (θ_x / θ_max) * R    (equidistant inverse)
-    //     → output pixel maps to SAME angular position in source, 1:1
-    //     → this is literally a rescale/crop, no distortion correction at all!
-    //     Wait — that can't be right. Let me re-examine...
-    //
-    //   Actually for cylindrical the SOURCE equidistant and the TARGET cylindrical
-    //   both map θ → r linearly, so the horizontal mapping IS 1:1.
-    //   What cylindrical DOES change is how off-axis vertical points are handled —
-    //   it separates azimuth from elevation properly.
-    //   For a HORIZONTAL STRIP where we only copy rows 1:1, the cylindrical
-    //   horizontal is identical to the fisheye horizontal. The benefit comes when
-    //   doing the FULL 2D remap. For our strip-only use case, cylindrical horizontal
-    //   = identity remap (no change to x), but we still get clean edges because
-    //   there's no tan() expansion.
-    //
-    //   So cylindrical for a horizontal strip = source strip, just rescaled to
-    //   output dimensions. The distortion at edges is exactly what the fisheye had.
-    //   That's fine — the fisheye edges look natural (equidistant is a "good"
-    //   projection for panoramas); it's rectilinear that stretches them.
-    //
-    //   Summary of what each projection does to our horizontal strip:
-    //   - Cylindrical: x_out ∝ θ_x  ↔  x_src ∝ θ_x  → 1:1 linear rescale
-    //   - Rectilinear: x_out ∝ tan(θ_x) → edge expansion, straight lines
+    // For each output pixel (ox, oy):
+    //   1. Convert to normalized output coords (ox_norm, oy_norm) in [-1,+1]
+    //   2. Compute the 3D ray direction (azimuth, elevation):
+    //        Cylindrical:  az = ox_norm * az_max
+    //                      el = atan(oy_norm * tan(el_max))
+    //        Rectilinear:  az = atan(ox_norm * tan(az_max))
+    //                      el = atan(oy_norm * tan(el_max))
+    //   3. Compute off-axis angle: theta = acos(cos(az)*cos(el))
+    //   4. Equidistant backward: r = theta/theta_max * R_circle
+    //   5. Project onto sensor:
+    //        x_src = cx + r * sin(az)/sin(theta)
+    //        y_src = cy + r * sin(el)/sin(theta)
+    //      (for theta≈0: x_src = cx + f_pix*az, y_src = cy + f_pix*el)
+    // -------------------------------------------------------------------------
 
     let img_ref   = &img;
-    let tan_th    = theta_h.tan();
+    let tan_el_max = el_max.tan();
+    let tan_az_max = az_max.tan();
 
     let pixels: Vec<(u32, u32, [u8; 3])> = (0..out_h)
         .into_par_iter()
         .flat_map(|oy| {
             let mut row = Vec::with_capacity(out_w as usize);
-            let src_y_frac = (oy as f64 + 0.5) / out_h as f64;
-            let src_y_px   = strip_y0 as f64 + src_y_frac * strip_h_px as f64;
+            // oy_norm: -1=top, 0=center, +1=bottom
+            let oy_norm = (oy as f64 + 0.5 - cy_out) / cy_out;
+            // Elevation angle (both projections use perspective vertical)
+            let el = (oy_norm * tan_el_max).atan();
 
             for ox in 0..out_w {
                 let ox_norm = (ox as f64 + 0.5 - cx_out) / cx_out;
 
-                // Find the horizontal angle this output pixel represents
-                let theta_x = match proj {
-                    // Cylindrical: linear in angle
-                    Projection::Cylindrical => ox_norm * theta_h,
-                    // Rectilinear: linear in tan(angle)
-                    Projection::Rectilinear => (ox_norm * tan_th).atan(),
+                // Azimuth angle
+                let az = match proj {
+                    Projection::Cylindrical => ox_norm * az_max,
+                    Projection::Rectilinear => (ox_norm * tan_az_max).atan(),
                 };
 
-                // Equidistant backward map: r = θ/θ_max * R
-                let src_x = src_cx + (theta_x / theta_max) * r_circle;
+                // Off-axis angle from optical axis
+                let cos_theta = az.cos() * el.cos();
+                let theta = cos_theta.acos();
 
-                let rgb = bilinear(img_ref, src_x, src_y_px);
+                // Source pixel via equidistant backward map
+                let (src_x, src_y) = if theta < 1e-9 {
+                    (src_cx, src_cy)
+                } else {
+                    let r = theta / theta_max * r_circle;
+                    let sin_th = theta.sin();
+                    (src_cx + r * az.sin() * el.cos() / sin_th,
+                     src_cy + r * el.sin() / sin_th)
+                };
+
+                let rgb = bilinear(img_ref, src_x, src_y).unwrap_or([0, 0, 0]);
                 row.push((ox, oy, rgb));
             }
             row
