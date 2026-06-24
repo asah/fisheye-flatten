@@ -1,32 +1,20 @@
 /// defish — Laowa 8-15mm: center-preserving graduated horizontal defish
 ///
-/// The output is WIDER than the input to preserve center pixel density.
-///
-/// Physics:
-///   Equidistant fisheye: r = (θ/θ_max) · R_circle   [uniform angular sampling]
-///   Rectilinear:         r = f · tan(θ)              [tan stretches edges]
-///
-///   Barrel distortion = fisheye packs edge content too close to center.
-///   Full rectilinear correction stretches edge content outward, which at
-///   constant output width means squishing the center. To avoid this, the
-///   output must be WIDER: center stays 1px/px, edges expand outward.
+/// Projection model:
+///   Equidistant fisheye: r = (θ/θ_max) · R_circle  [uniform angular sampling]
+///   Rectilinear output:  x = f · tan(θ)             [tan stretches edges]
 ///
 ///   Center-preserving output width:
-///     cx_out = tan(θ_h) / θ_max · R_circle
-///     out_w  = 2 · cx_out
-///   where θ_h = horizontal half-angle at the frame edge.
-///   This is always > src_w (typically +10-15% for 15mm, more at shorter FL).
+///     cx_out_full = tan(θ_h) / θ_max · R_circle
+///   This expands the output to keep center pixel density equal to source.
 ///
-///   For graduated blend (weight = edge_strength · |x|^blend_power):
-///     cx_out_blend = src_cx + edge_strength · (cx_out_full - src_cx)
-///   At blend_power→∞ or edge_strength=0: output width = src_w (pure crop).
-///   At edge_strength=1, blend_power→0: output width = cx_out_full.
+///   At wide focal lengths (8mm = 180° diagonal) tan(θ_h) → ∞, so we cap:
+///     --max-width-ratio (default 1.5) limits expansion to 1.5× source width.
+///   At 15mm: +13% (cap never triggers). At 8mm: capped at 1.5× (vs 2.83× uncapped).
 ///
-/// Backward map per output pixel at ox_norm ∈ [-1, +1]:
-///   theta_rect = atan(ox_norm · tan(θ_h))           [angle in rectilinear]
-///   r_fish     = theta_rect / θ_max · R_circle       [back through equidistant]
-///   src_x_full = cx + r_fish                         [full correction]
-///   src_x      = identity + weight · (full - identity)  [graduated]
+///   Graduated blend: weight = edge_strength · |x_norm|^blend_power
+///     weight=0 at center → identity (no change)
+///     weight=1 at edge   → full rectilinear correction
 
 use clap::Parser;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb};
@@ -38,7 +26,7 @@ use std::io::BufReader;
 #[derive(Parser, Debug)]
 #[command(
     name = "defish",
-    about = "Crop & defish Laowa 8-15mm fisheye — center-preserving, output widens to avoid center compression"
+    about = "Crop & defish Laowa 8-15mm fisheye — center-preserving graduated remap"
 )]
 struct Args {
     input: PathBuf,
@@ -60,7 +48,11 @@ struct Args {
     /// Max correction strength at far edge (0.0=none/pure crop, 1.0=full rectilinear)
     #[arg(short = 'e', long, default_value_t = 1.0)]
     edge_strength: f64,
-    /// Additional output scale multiplier (applied after auto-width expansion)
+    /// Max output width as a ratio of input width. Prevents extreme expansion at
+    /// wide focal lengths (8mm = 180° would otherwise expand 183%). Default 1.5.
+    #[arg(short = 'w', long, default_value_t = 1.5)]
+    max_width_ratio: f64,
+    /// Additional output scale multiplier
     #[arg(short = 's', long, default_value_t = 1.0)]
     scale: f64,
     /// Interpolation: nearest | bilinear
@@ -154,19 +146,26 @@ fn main() {
     // Sensor geometry
     let src_cx   = src_w as f64 / 2.0;
     let src_cy   = src_h as f64 / 2.0;
-    let r_circle = (src_cx*src_cx + src_cy*src_cy).sqrt();  // half-diagonal
+    let r_circle = (src_cx*src_cx + src_cy*src_cy).sqrt();
 
-    // Horizontal half-angle at frame edge (equidistant: r = θ/θ_max · R)
-    let theta_h     = (src_cx / r_circle) * theta_max;
-    let tan_theta_h = theta_h.tan();
+    // Horizontal half-angle at frame edge (equidistant)
+    let theta_h = (src_cx / r_circle) * theta_max;
 
-    // Center-preserving output half-width (full correction, edge_strength=1):
-    //   derivative of atan(x·tan_θh)/θ_max·R at x=0 equals tan_θh/θ_max·R
-    //   identity derivative at x=0 is src_cx
-    //   to match: cx_out_full = tan_θh / θ_max · R_circle
-    let cx_out_full  = tan_theta_h / theta_max * r_circle;
-    // Blend: interpolate output half-width between identity (src_cx) and full
-    let cx_out       = src_cx + args.edge_strength * (cx_out_full - src_cx);
+    // Center-preserving full output half-width
+    // tan(theta_h) can be large at wide angles — cap it
+    let tan_theta_h = theta_h.tan().min(args.max_width_ratio * src_cx / r_circle * theta_max / 1.0);
+    // Recompute tan_theta_h properly with cap on output width ratio:
+    // cx_out_full = tan(theta_h)/theta_max * R  -- cap so cx_out_full <= max_ratio * src_cx
+    let cx_out_full_uncapped = theta_h.tan() / theta_max * r_circle;
+    let cx_out_full = cx_out_full_uncapped.min(args.max_width_ratio * src_cx);
+    let was_capped  = cx_out_full_uncapped > cx_out_full;
+
+    // Effective tan_theta_h after cap (used for backward map)
+    // cx_out_full = tan_eff / theta_max * R  =>  tan_eff = cx_out_full * theta_max / R
+    let tan_theta_h_eff = cx_out_full * theta_max / r_circle;
+
+    // Blend output half-width between identity (src_cx) and full
+    let cx_out = src_cx + args.edge_strength * (cx_out_full - src_cx);
 
     // Strip
     let strip_frac  = args.strip_percent.clamp(0.01, 1.0);
@@ -174,24 +173,27 @@ fn main() {
     let strip_y0    = (src_h - strip_h_px) / 2;
 
     let out_w = ((cx_out * 2.0 * args.scale).round() as u32).max(1);
-    let out_h = ((strip_h_px as f64 * args.scale).round() as u32).max(1);
+    // Height: scale with width ratio to preserve pixel density
+    // (so aspect ratio within strip remains sensible)
+    let width_ratio = cx_out / src_cx;
+    let out_h = ((strip_h_px as f64 * width_ratio * args.scale).round() as u32).max(1);
 
     if args.verbose {
         eprintln!("Input: {}×{}  focal: {:.1}mm  crop: {:.3}  FF-equiv: {:.1}mm",
             src_w, src_h, focal_mm, crop_factor, fl_ff);
-        eprintln!("θ_max: {:.2}°  θ_h: {:.2}°  tan(θ_h): {:.4}  R_circle: {:.0}px",
-            theta_max.to_degrees(), theta_h.to_degrees(), tan_theta_h, r_circle);
-        eprintln!("cx_out_full (e=1): {:.0}px → out_w_full: {:.0}px  ({:+.1}% wider than src)",
-            cx_out_full, cx_out_full*2.0, (cx_out_full/src_cx - 1.0)*100.0);
-        eprintln!("cx_out (e={:.2}): {:.0}px → out_w: {}px",
-            args.edge_strength, cx_out, out_w);
-        eprintln!("Strip: y=[{}, {}] h={}px  output: {}×{}",
-            strip_y0, strip_y0+strip_h_px, strip_h_px, out_w, out_h);
-        eprintln!("blend_power: {}  edge_strength: {}", args.blend_power, args.edge_strength);
+        eprintln!("θ_max: {:.2}°  θ_h: {:.2}°  R_circle: {:.0}px",
+            theta_max.to_degrees(), theta_h.to_degrees(), r_circle);
+        eprintln!("cx_out_full (e=1, uncapped): {:.0}px  ({:+.1}% wider than src){}",
+            cx_out_full_uncapped, (cx_out_full_uncapped/src_cx - 1.0)*100.0,
+            if was_capped { format!("  → CAPPED at {:.1}×", args.max_width_ratio) } else { String::new() });
+        eprintln!("cx_out (e={:.2}): {:.0}px → out: {}×{}  ({:+.1}% wider)",
+            args.edge_strength, cx_out, out_w, out_h, (cx_out/src_cx - 1.0)*100.0);
+        eprintln!("blend_power: {}  edge_strength: {}  max_width_ratio: {}",
+            args.blend_power, args.edge_strength, args.max_width_ratio);
     }
 
-    let interp_mode  = args.interp.to_lowercase();
-    let img_ref      = &img;
+    let interp_mode = args.interp.to_lowercase();
+    let img_ref     = &img;
 
     let pixels: Vec<(u32, u32, [u8; 3])> = (0..out_h)
         .into_par_iter()
@@ -199,27 +201,27 @@ fn main() {
             let mut row = Vec::with_capacity(out_w as usize);
 
             // Map output row → source row within strip
+            // The strip occupies strip_h_px rows in the source.
+            // The output has out_h rows = strip_h_px * width_ratio.
+            // We need to sample the strip at the right vertical position.
             let src_y_frac = (oy as f64 + 0.5) / out_h as f64;
             let src_y_px   = strip_y0 as f64 + src_y_frac * strip_h_px as f64;
 
             for ox_px in 0..out_w {
-                // ox_norm: -1 = left edge, 0 = center, +1 = right edge
-                // Note: output cx_out may != src_cx, so we normalise by cx_out
+                // Normalize: -1=left edge, 0=center, +1=right edge
                 let ox_norm = (ox_px as f64 + 0.5 - cx_out) / cx_out;
 
-                // Identity: same relative position in source (no correction)
-                // ox_norm=0 → src_cx, ox_norm=±1 → 0 or src_w
+                // Identity source x
                 let id_src_x = src_cx + ox_norm * src_cx;
 
-                // Full rectilinear correction:
-                //   angle this output pixel represents: atan(ox_norm · tan_theta_h)
-                //   map back through equidistant:       r_fish = theta / theta_max · R_circle
-                let theta_rect = (ox_norm * tan_theta_h).atan();
+                // Full correction: atan maps linear tan-space back to angle,
+                // then equidistant maps angle back to source pixel
+                let theta_rect = (ox_norm * tan_theta_h_eff).atan();
                 let r_fish     = (theta_rect / theta_max) * r_circle;
-                let corr_src_x = src_cx + r_fish;  // signed: r_fish negative for left half
+                let corr_src_x = src_cx + r_fish;
 
-                // Graduated blend: 0 at center → edge_strength at edges
-                let weight     = args.edge_strength * ox_norm.abs().powf(args.blend_power);
+                // Graduated blend
+                let weight      = args.edge_strength * ox_norm.abs().powf(args.blend_power);
                 let final_src_x = id_src_x + weight * (corr_src_x - id_src_x);
 
                 let color = if interp_mode == "nearest" {
