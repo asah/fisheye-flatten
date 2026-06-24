@@ -1,0 +1,14 @@
+[package]
+name = "fisheye_defish"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "defish"
+path = "src/main.rs"
+
+[dependencies]
+image = { version = "=0.24.9", features = ["jpeg", "png", "tiff"] }
+clap = { version = "=4.4.18", features = ["derive"] }
+rayon = "=1.8.1"
+kamadak-exif = "=0.5.5"

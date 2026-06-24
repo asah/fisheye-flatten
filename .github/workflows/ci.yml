@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # windows-latest omitted: PIL test image generation uses python3
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Run unit tests
+        run: cargo test --release --locked
+
+      - name: Smoke test — defish the bundled test image
+        run: |
+          ./target/release/defish \
+            tests/test_fisheye.jpg \
+            --output /tmp/test_out.jpg \
+            --strip-percent 0.30 \
+            --focal-length 15.0 \
+            --crop-factor 1.0 \
+            --verbose
+          # Verify output exists and is non-empty
+          test -s /tmp/test_out.jpg && echo "Output file OK"
+
+      - name: Smoke test — GFX 100S II crop factor
+        run: |
+          ./target/release/defish \
+            tests/test_fisheye.jpg \
+            --output /tmp/test_gfx.jpg \
+            --strip-percent 0.30 \
+            --focal-length 15.0 \
+            --crop-factor 0.79 \
+            --verbose
+          test -s /tmp/test_gfx.jpg && echo "GFX output file OK"
+
+      - name: Smoke test — 8mm wide end
+        run: |
+          ./target/release/defish \
+            tests/test_fisheye.jpg \
+            --output /tmp/test_8mm.jpg \
+            --strip-percent 0.20 \
+            --focal-length 8.0 \
+            --crop-factor 1.0 \
+            --verbose
+          test -s /tmp/test_8mm.jpg && echo "8mm output file OK"
+
+      - name: Smoke test — different strip sizes
+        run: |
+          for pct in 0.10 0.20 0.30 0.50 0.80; do
+            ./target/release/defish \
+              tests/test_fisheye.jpg \
+              --output /tmp/test_strip_${pct}.jpg \
+              --strip-percent $pct \
+              --focal-length 15.0 \
+              --crop-factor 1.0
+            test -s /tmp/test_strip_${pct}.jpg && echo "Strip $pct OK"
+          done
+
+      - name: Upload test outputs as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defish-test-outputs-${{ matrix.os }}
+          path: /tmp/test_*.jpg
+          retention-days: 7
