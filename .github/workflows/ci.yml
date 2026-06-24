@@ -19,9 +19,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: actions/cache@v4
         with:
           path: |
@@ -31,55 +29,39 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Build (release)
+      - name: Build
         run: cargo build --release --locked
 
       - name: Unit tests
         run: cargo test --release --locked
 
-      - name: Smoke — default (bp=2.0, FF, 15mm)
+      - name: Smoke — 15mm full-frame (auto, 30% strip)
         run: |
           ./target/release/defish tests/test_fisheye.jpg \
-            -o /tmp/out_default.jpg -p 0.30 -f 15.0 -c 1.0 -v
-          test -s /tmp/out_default.jpg
+            -f 15 -c 1.0 -v
+          test -s tests/test_fisheye_defish.jpg
 
-      - name: Smoke — GFX 100S II crop factor
+      - name: Smoke — 15mm full-frame (50% strip, half scale)
         run: |
           ./target/release/defish tests/test_fisheye.jpg \
-            -o /tmp/out_gfx.jpg -p 0.30 -f 15.0 -c 0.79 -v
-          test -s /tmp/out_gfx.jpg
+            -o /tmp/out_15mm_50pct.jpg -p 0.5 -f 15 -c 1.0 -s 0.5 -v
+          test -s /tmp/out_15mm_50pct.jpg
 
-      - name: Smoke — 8mm wide end
+      - name: Smoke — GFX 100S II at 12mm
         run: |
           ./target/release/defish tests/test_fisheye.jpg \
-            -o /tmp/out_8mm.jpg -p 0.20 -f 8.0 -c 1.0 -v
-          test -s /tmp/out_8mm.jpg
+            -o /tmp/out_gfx_12mm.jpg -p 0.3 -f 12 -c 0.79 -v
+          test -s /tmp/out_gfx_12mm.jpg
 
-      - name: Smoke — blend power sweep (center-preserving tuning)
+      - name: Smoke — strip percent range
         run: |
-          for bp in 1.5 2.0 2.5 3.0; do
+          for pct in 0.1 0.3 0.5 0.8; do
             ./target/release/defish tests/test_fisheye.jpg \
-              -o /tmp/out_bp${bp}.jpg -p 0.30 -f 15.0 -c 1.0 -b $bp -e 1.0
-            test -s /tmp/out_bp${bp}.jpg && echo "bp=$bp OK"
-          done
-
-      - name: Smoke — edge strength sweep
-        run: |
-          for es in 0.5 0.75 1.0; do
-            ./target/release/defish tests/test_fisheye.jpg \
-              -o /tmp/out_es${es}.jpg -p 0.30 -f 15.0 -c 1.0 -b 2.0 -e $es
-            test -s /tmp/out_es${es}.jpg && echo "edge_strength=$es OK"
-          done
-
-      - name: Smoke — strip percent sweep
-        run: |
-          for pct in 0.10 0.20 0.30 0.50; do
-            ./target/release/defish tests/test_fisheye.jpg \
-              -o /tmp/out_strip${pct}.jpg -p $pct -f 15.0 -c 1.0
+              -o /tmp/out_strip${pct}.jpg -p $pct -f 15 -c 1.0
             test -s /tmp/out_strip${pct}.jpg && echo "strip=$pct OK"
           done
 
-      - name: Upload test outputs
+      - name: Upload outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
