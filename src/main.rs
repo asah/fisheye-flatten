@@ -198,6 +198,13 @@ struct AnimateArgs {
     /// Write a numbered image sequence instead of a video (no ffmpeg needed).
     #[arg(long)]
     frames: bool,
+    /// Start on the whole input frame and animate the top/bottom crop first,
+    /// then the unroll (instead of starting on the cropped strip).
+    #[arg(long)]
+    show_crop: bool,
+    /// Fraction of the timeline spent on the crop phase when --show-crop is set.
+    #[arg(long, default_value_t = 0.4)]
+    crop_frac: f64,
 }
 
 fn main() {
@@ -284,21 +291,49 @@ fn defish_source_coord(g: &Geom, ox: u32, oy: u32) -> (f64, f64) {
     }
 }
 
-/// Sample for a partial flatten at correction strength `t`:
+/// Fisheye passthrough source coord: a 1:1, center-anchored crop of the source
+/// (the strip region at the flatten's center scale). This is the t=0 state of
+/// the plain unroll — it coincides with the full flatten at the center.
+fn strip_passthrough_coord(g: &Geom, ox: u32, oy: u32) -> (f64, f64) {
+    (g.src_cx + (ox as f64 + 0.5 - g.cx_out) / g.scale,
+     g.src_cy + (oy as f64 + 0.5 - g.cy_out) / g.scale)
+}
+
+/// Whole-input source coord: the entire source frame fit into the output canvas
+/// (letterboxed), so the animation can start on the actual input photo before
+/// the crop. Pixels outside the fitted image sample out of bounds → black.
+fn full_fit_coord(g: &Geom, ox: u32, oy: u32) -> (f64, f64) {
+    let (src_w, src_h) = (2.0 * g.src_cx, 2.0 * g.src_cy);
+    let fit = (g.cx_out * 2.0 / src_w).min(g.cy_out * 2.0 / src_h);
+    (g.src_cx + (ox as f64 + 0.5 - g.cx_out) / fit,
+     g.src_cy + (oy as f64 + 0.5 - g.cy_out) / fit)
+}
+
+#[inline]
+fn lerp2(a: (f64, f64), b: (f64, f64), u: f64) -> (f64, f64) {
+    (a.0 + u * (b.0 - a.0), a.1 + u * (b.1 - a.1))
+}
+
+/// Sample for a partial flatten at strength `t`:
 ///   t = 1 → full flatten (exactly `defish_source_coord`)
-///   t = 0 → fisheye passthrough: a 1:1, center-anchored crop of the source
-/// The two coincide at the center (the defish is ~identity there), so the center
-/// stays put while the edges "unroll" — that's the animation.
-fn defish_sample(g: &Geom, img: &DynamicImage, ox: u32, oy: u32, t: f64) -> [u8; 3] {
-    let (s1x, s1y) = defish_source_coord(g, ox, oy);
-    let (sx, sy) = if t >= 1.0 {
-        (s1x, s1y)
+///   t = 0 → fisheye passthrough (or the full input frame, if `show_crop`)
+/// Plain mode morphs passthrough → flatten (center-anchored "unroll"). With
+/// `show_crop`, the first `crop_frac` of the timeline morphs the full input
+/// frame → the cropped strip (animating the top/bottom crop), then the rest
+/// unrolls. The last frame is always the full flatten.
+fn defish_sample(g: &Geom, img: &DynamicImage, ox: u32, oy: u32, t: f64,
+                 show_crop: bool, crop_frac: f64) -> [u8; 3] {
+    let s1 = defish_source_coord(g, ox, oy);
+    let (sx, sy) = if !show_crop {
+        if t >= 1.0 { s1 } else { lerp2(strip_passthrough_coord(g, ox, oy), s1, t) }
     } else {
-        // Center-anchored 1:1 passthrough; /scale because output px are denser
-        // (or sparser) than source px by exactly the scale factor at the center.
-        let s0x = g.src_cx + (ox as f64 + 0.5 - g.cx_out) / g.scale;
-        let s0y = g.src_cy + (oy as f64 + 0.5 - g.cy_out) / g.scale;
-        (s0x + t * (s1x - s0x), s0y + t * (s1y - s0y))
+        let c = crop_frac.clamp(0.01, 0.99);
+        let s0 = strip_passthrough_coord(g, ox, oy);
+        if t <= c {
+            lerp2(full_fit_coord(g, ox, oy), s0, t / c) // phase 1: crop
+        } else {
+            lerp2(s0, s1, (t - c) / (1.0 - c))          // phase 2: unroll
+        }
     };
     bilinear(img, sx, sy).unwrap_or([0, 0, 0])
 }
@@ -434,7 +469,7 @@ fn run_flatten(args: &FlattenArgs) {
     let r = resolve(args, args.scale);
     if args.verbose { verbose_geom(&r, args.quality); }
 
-    let out_img = render(r.g.out_w, r.g.out_h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, 1.0));
+    let out_img = render(r.g.out_w, r.g.out_h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, 1.0, false, 0.5));
 
     let out_path = args.output.clone().unwrap_or_else(|| default_output(&args.input, "defish"));
     save_image(&out_img, &out_path, args.quality).unwrap_or_else(|e| {
@@ -676,7 +711,7 @@ fn run_animate(args: &AnimateArgs) {
         let stem = sequence_stem(&fa.input, fa.output.as_ref());
         for i in 0..steps {
             let t = t_of(i);
-            let frame = render(w, h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, t));
+            let frame = render(w, h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, t, args.show_crop, args.crop_frac));
             let path = PathBuf::from(format!("{}_{:04}.{}", stem, i, ext));
             save_image(&frame, &path, fa.quality).unwrap_or_else(|e| {
                 eprintln!("Cannot save frame {i}: {e}"); std::process::exit(1);
@@ -716,7 +751,7 @@ fn run_animate(args: &AnimateArgs) {
     let mut stdin = child.stdin.take().expect("ffmpeg stdin");
     for i in 0..steps {
         let t = t_of(i);
-        let frame = render(w, h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, t));
+        let frame = render(w, h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, t, args.show_crop, args.crop_frac));
         if let Err(e) = stdin.write_all(frame.as_raw()) {
             eprintln!("\nffmpeg pipe closed early: {e}"); break;
         }
