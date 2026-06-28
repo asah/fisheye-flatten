@@ -16,6 +16,28 @@ use std::process::{Command as Proc, Stdio};
 
 use fisheye_defish::*;
 
+/// How `animate --show-crop` blends the framing change with the unroll.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CropStyle {
+    /// No crop animation: start already cropped to the strip (plain unroll).
+    Plain,
+    /// Zoom/crop and unroll at the same time — one fluid motion.
+    Simul,
+    /// Crop first, then unroll (two distinct phases; uses --crop-frac).
+    Phased,
+}
+
+impl std::str::FromStr for CropStyle {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "simul" | "simultaneous" | "blend" => Ok(CropStyle::Simul),
+            "phased" | "sequential" | "steps" => Ok(CropStyle::Phased),
+            _ => Err(format!("Unknown crop style '{}'. Use simul or phased.", s)),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "defish", version,
     about = "Fisheye toolkit: flatten (and, soon, refish / tunnel) for the Laowa 8-15mm",
@@ -198,11 +220,15 @@ struct AnimateArgs {
     /// Write a numbered image sequence instead of a video (no ffmpeg needed).
     #[arg(long)]
     frames: bool,
-    /// Start on the whole input frame and animate the top/bottom crop first,
-    /// then the unroll (instead of starting on the cropped strip).
+    /// Start on the whole input frame and animate the crop as well as the unroll
+    /// (instead of starting already cropped to the strip).
     #[arg(long)]
     show_crop: bool,
-    /// Fraction of the timeline spent on the crop phase when --show-crop is set.
+    /// With --show-crop, how to blend crop and unroll: `simul` (one fluid motion,
+    /// default) or `phased` (crop first, then unroll).
+    #[arg(long, default_value = "simul")]
+    crop_style: CropStyle,
+    /// Fraction of the timeline spent on the crop phase (--crop-style phased only).
     #[arg(long, default_value_t = 0.4)]
     crop_frac: f64,
 }
@@ -314,25 +340,40 @@ fn lerp2(a: (f64, f64), b: (f64, f64), u: f64) -> (f64, f64) {
     (a.0 + u * (b.0 - a.0), a.1 + u * (b.1 - a.1))
 }
 
-/// Sample for a partial flatten at strength `t`:
-///   t = 1 → full flatten (exactly `defish_source_coord`)
-///   t = 0 → fisheye passthrough (or the full input frame, if `show_crop`)
-/// Plain mode morphs passthrough → flatten (center-anchored "unroll"). With
-/// `show_crop`, the first `crop_frac` of the timeline morphs the full input
-/// frame → the cropped strip (animating the top/bottom crop), then the rest
-/// unrolls. The last frame is always the full flatten.
+/// Sample for a partial flatten at strength `t` (t=1 → full flatten):
+///   Plain  — morph fisheye-strip passthrough → flatten (center-anchored unroll)
+///   Simul  — morph the full input frame → flatten: crop/zoom and unroll at once
+///   Phased — full frame → cropped strip (first `crop_frac`), then strip → flat
+/// The last frame is always exactly the full flatten.
 fn defish_sample(g: &Geom, img: &DynamicImage, ox: u32, oy: u32, t: f64,
-                 show_crop: bool, crop_frac: f64) -> [u8; 3] {
+                 style: CropStyle, crop_frac: f64) -> [u8; 3] {
     let s1 = defish_source_coord(g, ox, oy);
-    let (sx, sy) = if !show_crop {
-        if t >= 1.0 { s1 } else { lerp2(strip_passthrough_coord(g, ox, oy), s1, t) }
+    let (sx, sy) = if t >= 1.0 {
+        s1
     } else {
-        let c = crop_frac.clamp(0.01, 0.99);
-        let s0 = strip_passthrough_coord(g, ox, oy);
-        if t <= c {
-            lerp2(full_fit_coord(g, ox, oy), s0, t / c) // phase 1: crop
-        } else {
-            lerp2(s0, s1, (t - c) / (1.0 - c))          // phase 2: unroll
+        match style {
+            CropStyle::Plain => lerp2(strip_passthrough_coord(g, ox, oy), s1, t),
+            CropStyle::Simul => {
+                // Decouple zoom from warp so both progress visibly throughout
+                // (a plain coordinate lerp lets the large zoom saturate early,
+                // leaving "zoom, then warp"). Warp linearly; zoom geometrically
+                // (constant perceptual speed) from whole-frame back to the strip.
+                let (src_w, src_h) = (2.0 * g.src_cx, 2.0 * g.src_cy);
+                let fit = (g.cx_out * 2.0 / src_w).min(g.cy_out * 2.0 / src_h);
+                let zmax = g.scale / fit;        // zoom-out factor for the full frame
+                let z = zmax.powf(1.0 - t);      // geometric zoom: zmax → 1
+                let sw = lerp2(strip_passthrough_coord(g, ox, oy), s1, t); // warp
+                (g.src_cx + z * (sw.0 - g.src_cx), g.src_cy + z * (sw.1 - g.src_cy))
+            }
+            CropStyle::Phased => {
+                let c = crop_frac.clamp(0.01, 0.99);
+                let s0 = strip_passthrough_coord(g, ox, oy);
+                if t <= c {
+                    lerp2(full_fit_coord(g, ox, oy), s0, t / c) // phase 1: crop
+                } else {
+                    lerp2(s0, s1, (t - c) / (1.0 - c))          // phase 2: unroll
+                }
+            }
         }
     };
     bilinear(img, sx, sy).unwrap_or([0, 0, 0])
@@ -469,7 +510,7 @@ fn run_flatten(args: &FlattenArgs) {
     let r = resolve(args, args.scale);
     if args.verbose { verbose_geom(&r, args.quality); }
 
-    let out_img = render(r.g.out_w, r.g.out_h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, 1.0, false, 0.5));
+    let out_img = render(r.g.out_w, r.g.out_h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, 1.0, CropStyle::Plain, 0.5));
 
     let out_path = args.output.clone().unwrap_or_else(|| default_output(&args.input, "defish"));
     save_image(&out_img, &out_path, args.quality).unwrap_or_else(|e| {
@@ -698,6 +739,7 @@ fn run_animate(args: &AnimateArgs) {
     }
     // t: 0 → fisheye, 1 → fully flat.
     let t_of = |i: u32| if steps <= 1 { 1.0 } else { i as f64 / (steps - 1) as f64 };
+    let style = if args.show_crop { args.crop_style } else { CropStyle::Plain };
 
     // Numbered image sequence: explicit --frames, or fallback when ffmpeg absent.
     if args.frames || !ffmpeg_available() {
@@ -711,7 +753,7 @@ fn run_animate(args: &AnimateArgs) {
         let stem = sequence_stem(&fa.input, fa.output.as_ref());
         for i in 0..steps {
             let t = t_of(i);
-            let frame = render(w, h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, t, args.show_crop, args.crop_frac));
+            let frame = render(w, h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, t, style, args.crop_frac));
             let path = PathBuf::from(format!("{}_{:04}.{}", stem, i, ext));
             save_image(&frame, &path, fa.quality).unwrap_or_else(|e| {
                 eprintln!("Cannot save frame {i}: {e}"); std::process::exit(1);
@@ -751,7 +793,7 @@ fn run_animate(args: &AnimateArgs) {
     let mut stdin = child.stdin.take().expect("ffmpeg stdin");
     for i in 0..steps {
         let t = t_of(i);
-        let frame = render(w, h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, t, args.show_crop, args.crop_frac));
+        let frame = render(w, h, |ox, oy| defish_sample(&r.g, &r.img, ox, oy, t, style, args.crop_frac));
         if let Err(e) = stdin.write_all(frame.as_raw()) {
             eprintln!("\nffmpeg pipe closed early: {e}"); break;
         }

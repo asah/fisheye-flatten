@@ -88,10 +88,12 @@ fully-flattened panorama (last frame), anchored at the center so the edges
   player compatibility — at low `--fps` each morph frame is simply held for
   several video frames (perceived speed and duration are unchanged). This avoids
   finicky players (QuickTime/Preview) refusing to animate very-low-fps clips.
-- `--show-crop` starts on the **whole input frame** and animates the top/bottom
-  crop first, then the unroll — so it tells the full story (full photo → strip →
-  flat). `--crop-frac` (default 0.4) sets how much of the timeline the crop phase
-  takes. Without it, the animation starts already cropped to the strip.
+- `--show-crop` starts on the **whole input frame** so the animation tells the
+  full story (full photo → flat). `--crop-style simul` (default) crops/zooms and
+  unrolls in one fluid motion; `--crop-style phased` does the crop first, then
+  the unroll (two distinct phases, with `--crop-frac` setting the crop phase's
+  share, default 0.4). Without `--show-crop`, the animation starts already
+  cropped to the strip.
 
 ## Usage
 
