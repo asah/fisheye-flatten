@@ -32,32 +32,32 @@ The output is **wider than the input** — this is correct, not a bug. Rectiline
 for `defish flatten photo.jpg ...` — existing commands keep working unchanged.
 All subcommands share one remap engine and lens model (`src/lib.rs`).
 
-### refish — make a photo look like a fisheye
+### refish — make a photo look like a fisheye (and invert flatten)
 
 ```bash
-defish refish photo.jpg                  # fisheye that fills the frame (barrel, -k 1)
-defish refish photo.jpg -k 2.5           # stronger curvature
-defish refish photo.jpg --fov 150        # physical 150° projection (to invert a real fisheye)
-defish refish photo.jpg --source-fov 75  # physical; source lacks usable EXIF
+defish refish photo.jpg          # physical fisheye; a bare defish inverts it
+defish refish photo.jpg --fov 180   # wider / more dramatic
+defish refish photo.jpg --barrel -k 2.5   # creative barrel (not invertible)
 ```
 
 Two modes:
 
-- **Barrel (default).** A fill-the-frame fisheye whose curvature is set by
-  `-k/--strength` (0 = a plain circular crop, higher = more bow). It's
-  independent of the source's field of view, so **any** image becomes an obvious
-  fisheye that fills the disc. This is the "make it look like a fisheye" mode.
-- **Physical** (when you pass `--fov`, `--source-fov`, or `-f`). The **exact
-  analytic inverse of `flatten`** (same separable az/el model). It only bends as
-  much as the field of view allows, so a narrow-FoV source barely curves. Use it
-  to invert a real fisheye — `refish` then `flatten` with the **same**
-  `-f`/`-c`/`-p`/`--projection` reproduces the input (modulo the cropped /
-  out-of-FoV parts):
+- **Physical (default).** The **exact analytic inverse of `flatten`** (same
+  separable az/el model). It **stamps the geometry it used into the output's
+  EXIF**, so a *bare* `defish` reads it back and recovers the original — no
+  matching flags needed:
 
   ```bash
-  defish refish photo.jpg  -f 10 -c 1 -p 80 --projection rect -o fisheye.jpg
-  defish flatten fisheye.jpg -f 10 -c 1 -p 80 --projection rect -o back.jpg   # ≈ photo.jpg
+  defish refish photo.jpg          # → photo_refish.jpg  (geometry stamped)
+  defish photo_refish.jpg          # → photo_refish_defish.jpg ≈ photo.jpg (modulo clipping)
   ```
+
+  Set the lens angle with `--fov` / `-f` (default ≈ a 130° fisheye). Warp
+  strength is the field of view, so a narrow angle bends only a little.
+- **Barrel** (`--barrel`). A fill-the-frame fisheye whose curvature is set by
+  `-k/--strength`, independent of field of view — turns **any** image into an
+  obvious fisheye that fills the disc. It's a creative effect, **not** invertible
+  by `flatten`.
 
 Output is a square; `--size` sets the diameter (default: the shorter source side).
 
@@ -104,11 +104,11 @@ fully-flattened panorama (last frame), anchored at the center so the edges
   several video frames (perceived speed and duration are unchanged). This avoids
   finicky players (QuickTime/Preview) refusing to animate very-low-fps clips.
 - `--show-crop` starts on the **whole input frame** so the animation tells the
-  full story (full photo → flat). `--crop-style simul` (default) crops/zooms and
-  unrolls in one fluid motion; `--crop-style phased` does the crop first, then
-  the unroll (two distinct phases, with `--crop-frac` setting the crop phase's
-  share, default 0.4). Without `--show-crop`, the animation starts already
-  cropped to the strip.
+  full story (full photo → flat). `--crop-style` orders the crop vs the unroll:
+  `simul` (default — both at once, one fluid motion), `phased` (crop first, then
+  unroll), or `warp-first` (unroll the full frame first, then crop/zoom to the
+  strip). `--crop-frac` (default 0.4) sets the first phase's share for the latter
+  two. Without `--show-crop`, the animation starts already cropped to the strip.
 
 ## Usage
 

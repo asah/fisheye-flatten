@@ -100,20 +100,47 @@ fn calibrate_reports_scale_without_writing_an_image() {
 // ------------------------------------------------------------------ refish ---
 
 #[test]
-fn refish_default_barrel_warps_the_image() {
-    // Default (no FoV flags) is the fill-the-frame barrel: -k 0 is a plain
-    // circular crop, higher strengths bend the image. They must differ.
+fn refish_barrel_strength_warps_the_image() {
+    // --barrel: -k 0 is a plain circular crop, higher strengths bend the image.
     let checker = fixture(CHECKER);
     let crop = tmp("cli_refish_k0.jpg");
     let warp = tmp("cli_refish_k2.jpg");
-    run(&["refish", path(&checker), "-k", "0", "--size", "400", "-o", path(&crop)]);
-    run(&["refish", path(&checker), "-k", "2", "--size", "400", "-o", path(&warp)]);
+    run(&["refish", path(&checker), "--barrel", "-k", "0", "--size", "400", "-o", path(&crop)]);
+    run(&["refish", path(&checker), "--barrel", "-k", "2", "--size", "400", "-o", path(&warp)]);
     assert_eq!(dims(&crop), (400, 400));
     assert_eq!(dims(&warp), (400, 400));
     assert!(
         mean_abs_diff(&load(&crop), &load(&warp)) > 5.0,
         "barrel --strength should visibly warp vs a plain crop"
     );
+}
+
+#[test]
+fn refish_then_defish_round_trips_with_no_flags() {
+    // The headline behaviour: bare `refish` (physical default) stamps its
+    // geometry into EXIF, and a bare `flatten` reads it back and recovers the
+    // checkerboard — same brightness/contrast and an on-axis straight cross.
+    let dir = tmp("cli_rt");
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("checker.jpg");
+    std::fs::copy(fixture(CHECKER), &input).unwrap();
+
+    run(&["refish", path(&input)]); // → checker_refish.jpg (stamped)
+    let fish = dir.join("checker_refish.jpg");
+    assert!(fish.exists(), "refish output missing");
+    run(&["flatten", path(&fish)]); // → checker_refish_defish.jpg (reads stamp)
+    let back = dir.join("checker_refish_defish.jpg");
+    assert!(back.exists(), "flatten output missing");
+
+    let src = load(&fixture(CHECKER));
+    let out = load(&back);
+    let (sm, ss) = central_stats(&src, 0.4);
+    let (rm, rs) = central_stats(&out, 0.4);
+    assert!((sm - rm).abs() < 15.0, "brightness drift: {sm:.1} vs {rm:.1}");
+    assert!(rs > 40.0 && (ss - rs).abs() < 20.0, "contrast drift: {ss:.1} vs {rs:.1}");
+    let (rw, rh) = out.dimensions();
+    assert!(red_band_fraction(&out, rw / 2) > 0.3, "red center line not recovered");
+    assert!(green_band_fraction(&out, rh / 2) > 0.3, "green center line not recovered");
 }
 
 #[test]

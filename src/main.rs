@@ -25,6 +25,8 @@ enum CropStyle {
     Simul,
     /// Crop first, then unroll (two distinct phases; uses --crop-frac).
     Phased,
+    /// Unroll first (full frame straightens), then crop/zoom to the strip.
+    WarpFirst,
 }
 
 impl std::str::FromStr for CropStyle {
@@ -32,8 +34,9 @@ impl std::str::FromStr for CropStyle {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "simul" | "simultaneous" | "blend" => Ok(CropStyle::Simul),
-            "phased" | "sequential" | "steps" => Ok(CropStyle::Phased),
-            _ => Err(format!("Unknown crop style '{}'. Use simul or phased.", s)),
+            "phased" | "sequential" | "steps" | "crop-first" => Ok(CropStyle::Phased),
+            "warp-first" | "warpfirst" | "warp" => Ok(CropStyle::WarpFirst),
+            _ => Err(format!("Unknown crop style '{}'. Use simul, phased, or warp-first.", s)),
         }
     }
 }
@@ -122,23 +125,27 @@ struct FlattenArgs {
 #[command(long_about = "\
 Turn a normal (rectilinear) photo into a circular fisheye — straight lines bow \
 outward and the frame wraps into a disc.\n\n\
-Default: a fill-the-frame barrel whose curvature is set by --strength, so ANY \
-image becomes an obvious fisheye regardless of its field of view.\n\n\
-Physical mode (give --fov, --source-fov, or -f) instead does the faithful \
-rectilinear→equidistant projection — exact, but a narrow-FoV source barely \
-bends (it looks like a circular crop). Use this to invert a real fisheye.\n\n\
+Default: PHYSICAL mode — the exact inverse of flatten. It stamps the geometry \
+it used into the output's EXIF, so a bare `defish` reads it back and recovers \
+the original (modulo the cropped / out-of-FoV parts). Set the lens angle with \
+--fov / -f (default ≈ a 130° fisheye).\n\n\
+--barrel: a fill-the-frame barrel whose curvature is set by --strength. Warps \
+ANY image into an obvious fisheye regardless of field of view, but is NOT \
+invertible by flatten (a creative effect, not a round-trip).\n\n\
 Examples:\n  \
-  defish refish photo.jpg                  # fisheye, fills the frame (strength 1)\n  \
-  defish refish photo.jpg -k 2             # stronger curvature\n  \
-  defish refish photo.jpg --fov 150        # physical 150° projection\n  \
-  defish refish photo.jpg --source-fov 75  # physical, source has no EXIF"
+  defish refish photo.jpg                  # physical fisheye; defish inverts it\n  \
+  defish refish photo.jpg --fov 180        # wider, more dramatic\n  \
+  defish refish photo.jpg --barrel -k 2    # creative barrel (not invertible)"
 )]
 struct RefishArgs {
     input: PathBuf,
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Barrel curvature for the default mode: 0 = none (circular crop), higher =
-    /// more fisheye. Ignored in physical mode (--fov/--source-fov/-f).
+    /// Use the fill-the-frame barrel effect instead of the physical (invertible)
+    /// projection. Warps any image, but flatten can't round-trip it.
+    #[arg(long)]
+    barrel: bool,
+    /// Barrel curvature (with --barrel): 0 = none (circular crop), higher = more.
     #[arg(short = 'k', long, default_value_t = 1.0)]
     strength: f64,
     /// Output fisheye diameter in pixels (default: shorter source side)
@@ -239,11 +246,12 @@ struct AnimateArgs {
     /// (instead of starting already cropped to the strip).
     #[arg(long)]
     show_crop: bool,
-    /// With --show-crop, how to blend crop and unroll: `simul` (one fluid motion,
-    /// default) or `phased` (crop first, then unroll).
+    /// With --show-crop, how to order crop and unroll: `simul` (one fluid
+    /// motion, default), `phased` (crop first, then unroll), or `warp-first`
+    /// (unroll the full frame first, then crop/zoom to the strip).
     #[arg(long, default_value = "simul")]
     crop_style: CropStyle,
-    /// Fraction of the timeline spent on the crop phase (--crop-style phased only).
+    /// Fraction of the timeline for the first phase (phased / warp-first only).
     #[arg(long, default_value_t = 0.4)]
     crop_frac: f64,
 }
@@ -389,6 +397,22 @@ fn defish_sample(g: &Geom, img: &DynamicImage, ox: u32, oy: u32, t: f64,
                     lerp2(s0, s1, (t - c) / (1.0 - c))          // phase 2: unroll
                 }
             }
+            CropStyle::WarpFirst => {
+                // Reverse of Phased: unroll the full (zoomed-out) frame first,
+                // then zoom/crop into the strip. Uses the same decoupled warp/
+                // zoom as Simul: warp w, geometric zoom z (zmax=whole frame → 1).
+                let (src_w, src_h) = (2.0 * g.src_cx, 2.0 * g.src_cy);
+                let fit = (g.cx_out * 2.0 / src_w).min(g.cy_out * 2.0 / src_h);
+                let zmax = g.scale / fit;
+                let c = crop_frac.clamp(0.01, 0.99);
+                let (w, z) = if t <= c {
+                    (t / c, zmax)                                  // phase 1: warp, stay wide
+                } else {
+                    (1.0, zmax.powf(1.0 - (t - c) / (1.0 - c)))    // phase 2: zoom in, warped
+                };
+                let sw = lerp2(strip_passthrough_coord(g, ox, oy), s1, w);
+                (g.src_cx + z * (sw.0 - g.src_cx), g.src_cy + z * (sw.1 - g.src_cy))
+            }
         }
     };
     bilinear(img, sx, sy).unwrap_or([0, 0, 0])
@@ -446,26 +470,40 @@ fn resolve(args: &FlattenArgs, scale: f64) -> Resolved {
     let (src_w, src_h) = d.img.dimensions();
     let (src_cx, src_cy) = (src_w as f64 / 2.0, src_h as f64 / 2.0);
 
-    // Focal length: explicit flag, then EXIF (non-positive = absent, as manual
-    // lenses report 0), then recovered from the image circle.
-    let focal_mm = args.focal_length
-        .or_else(|| read_exif_focal_length(&args.input).filter(|f| *f > 0.0))
-        .unwrap_or_else(|| auto_focal_length(d.r_circle, d.is_circular, d.pitch_mm, d.crop_factor, args.calib_scale));
+    let explicit_focal = args.focal_length
+        .or_else(|| read_exif_focal_length(&args.input).filter(|f| *f > 0.0));
+    let stamp = read_refish_stamp(&args.input);
+
+    // Geometry: a `refish` stamp (when present and not overridden by an explicit
+    // -f) makes flatten the exact inverse of that refish — bare round-trips work.
+    // Otherwise: focal (flag/EXIF/auto-detected) → theta_max via the lens model.
+    let (theta_max, proj, r_circle, focal_mm) = match (&stamp, explicit_focal) {
+        (Some(st), None) => {
+            let proj = args.projection.clone().unwrap_or(st.proj.clone());
+            (st.theta_max, proj, st.r_circle, 0.0)
+        }
+        (_, focal) => {
+            let focal_mm = focal.unwrap_or_else(|| auto_focal_length(
+                d.r_circle, d.is_circular, d.pitch_mm, d.crop_factor, args.calib_scale));
+            let theta_max = laowa_half_aov_deg((focal_mm * d.crop_factor).clamp(8.0, 15.0)).to_radians();
+            let proj = args.projection.clone().unwrap_or(
+                if d.is_circular { Projection::Cylindrical } else { Projection::Rectilinear });
+            (theta_max, proj, d.r_circle, focal_mm)
+        }
+    };
     let fl_ff = focal_mm * d.crop_factor;
-    let theta_max = laowa_half_aov_deg(fl_ff.clamp(8.0, 15.0)).to_radians();
-    let proj = args.projection.clone().unwrap_or(
-        if d.is_circular { Projection::Cylindrical } else { Projection::Rectilinear });
+
     // -p accepts a fraction (0.30) or a percentage (30): values >1 → percent.
     let strip_frac = (if args.strip_percent > 1.0 {
         args.strip_percent / 100.0
     } else {
         args.strip_percent
     }).clamp(0.01, 0.99);
-    let g = build_geom(src_cx, src_cy, d.r_circle, d.is_circular, theta_max, strip_frac,
+    let g = build_geom(src_cx, src_cy, r_circle, d.is_circular, theta_max, strip_frac,
                        proj.clone(), scale);
     Resolved {
         img: d.img, g, focal_mm, crop_factor: d.crop_factor, fl_ff, pitch_mm: d.pitch_mm,
-        r_circle: d.r_circle, is_circular: d.is_circular, strip_frac, proj,
+        r_circle, is_circular: d.is_circular, strip_frac, proj,
     }
 }
 
@@ -582,19 +620,17 @@ fn run_refish(args: &RefishArgs) {
     let img_ref = &img;
 
     // Two modes:
-    //   * Physical (gnomonic): faithful rectilinear→equidistant projection. Used
-    //     when the geometry is given (--fov / --source-fov / -f), e.g. to invert
-    //     a real fisheye. The warp it produces is only as strong as the field of
-    //     view, so a narrow source barely bends — it looks like a circular crop.
-    //   * Barrel (default): a fill-the-frame fisheye whose curvature is set by
-    //     --strength, independent of the source's field of view, so ANY image
-    //     turns into an obvious fisheye that fills the circle.
-    let physical = args.fov.is_some() || args.source_fov.is_some() || args.focal_length.is_some();
+    //   * Physical (default): the exact analytic inverse of flatten. It stamps
+    //     its geometry into the output EXIF so a bare `flatten` reads it back and
+    //     recovers the original. Warp strength = the chosen field of view.
+    //   * Barrel (--barrel): a fill-the-frame fisheye whose curvature is set by
+    //     --strength, independent of field of view, so ANY image turns into an
+    //     obvious fisheye — but flatten can't invert it.
+    let physical = !args.barrel;
 
     let (out_img, description) = if physical {
         // Exact analytic inverse of `flatten` (defish_source_coord): same
-        // separable az/el model and shared geometry, so refish→flatten with
-        // matching -f/-c/-p/--projection round-trips (modulo crop/resampling).
+        // separable az/el model and shared geometry.
         let crop = args.crop_factor.unwrap_or_else(||
             read_exif_model(&args.input).map(|m| detect_crop_factor(&m)).unwrap_or(1.0));
         let theta_max = if let Some(fov) = args.fov {
@@ -606,14 +642,16 @@ fn run_refish(args: &RefishArgs) {
         } else if let Some(sfov) = args.source_fov {
             (sfov.to_radians() / 2.0).min(89.9_f64.to_radians())
         } else {
-            45.0_f64.to_radians()
+            laowa_half_aov_deg(10.0).to_radians() // default ≈130° fisheye
         };
         let strip_frac = (if args.strip_percent > 1.0 {
             args.strip_percent / 100.0
         } else {
             args.strip_percent
         }).clamp(0.01, 0.99);
-        let proj = args.projection.clone().unwrap_or(Projection::Rectilinear);
+        // Default cylindrical: matches flatten's auto-choice for a circular
+        // fisheye, so a bare round-trip lines up.
+        let proj = args.projection.clone().unwrap_or(Projection::Cylindrical);
         // Build the same geometry `flatten` would for a fisheye of this radius.
         let g = build_geom(r_out, r_out, r_out, true, theta_max, strip_frac, proj.clone(), 1.0);
         let (in_cx, in_cy) = (src_cx, src_cy); // the rectilinear input
@@ -646,9 +684,11 @@ fn run_refish(args: &RefishArgs) {
             if ox_norm.abs() > 1.0 || oy_norm.abs() > 1.0 { return [0, 0, 0]; }
             bilinear(img_ref, in_cx * (1.0 + ox_norm), in_cy * (1.0 + oy_norm)).unwrap_or([0, 0, 0])
         });
+        // Stamp the geometry so a bare `flatten` inverts this exactly.
         let desc = format!(
-            "refish (fisheye-flatten v{ver}): rectilinear->fisheye (physical inverse), \
-             theta_max={tm:.1}deg, projection={proj:?}, strip={strip:.0}%, size={sz}px, quality={q}, source={src}",
+            "{stamp} refish (fisheye-flatten v{ver}): rectilinear->fisheye (physical inverse), \
+             coverage={tm:.1}deg, projection={proj:?}, strip={strip:.0}%, size={sz}px, quality={q}, source={src}",
+            stamp = refish_stamp_token(theta_max, &proj, r_out),
             ver = env!("CARGO_PKG_VERSION"), tm = theta_max.to_degrees() * 2.0, proj = proj,
             strip = strip_frac * 100.0, sz = size, q = args.quality.clamp(1, 100),
             src = args.input.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),

@@ -53,6 +53,48 @@ pub fn read_exif_model(path: &Path) -> Option<String> {
         .display_value().to_string())
 }
 
+pub fn read_exif_image_description(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut buf = BufReader::new(file);
+    let exif = exif::Reader::new().read_from_container(&mut buf).ok()?;
+    Some(exif.get_field(exif::Tag::ImageDescription, exif::In::PRIMARY)?
+        .display_value().to_string())
+}
+
+/// The exact geometry `refish` used, stamped into the output's ImageDescription
+/// so a bare `flatten` can read it back and invert that refish precisely.
+pub struct RefishStamp {
+    pub theta_max: f64,   // radians
+    pub proj: Projection,
+    pub r_circle: f64,    // px
+}
+
+/// Format the stamp token embedded at the start of refish's ImageDescription.
+pub fn refish_stamp_token(theta_max: f64, proj: &Projection, r_circle: f64) -> String {
+    let p = match proj { Projection::Cylindrical => "cyl", Projection::Rectilinear => "rect" };
+    format!("[ff-refish theta={:.6} proj={} r={:.2}]", theta_max, p, r_circle)
+}
+
+/// Parse a refish stamp out of an image's ImageDescription, if present.
+pub fn read_refish_stamp(path: &Path) -> Option<RefishStamp> {
+    let desc = read_exif_image_description(path)?;
+    let start = desc.find("[ff-refish ")?;
+    let body = &desc[start + "[ff-refish ".len()..];
+    let body = &body[..body.find(']')?];
+    let (mut theta, mut proj, mut r) = (None, None, None);
+    for tok in body.split_whitespace() {
+        if let Some((k, v)) = tok.split_once('=') {
+            match k {
+                "theta" => theta = v.parse::<f64>().ok(),
+                "proj" => proj = v.parse::<Projection>().ok(),
+                "r" => r = v.parse::<f64>().ok(),
+                _ => {}
+            }
+        }
+    }
+    Some(RefishStamp { theta_max: theta?, proj: proj?, r_circle: r? })
+}
+
 pub fn detect_crop_factor(model: &str) -> f64 {
     let m = model.to_lowercase();
     if m.contains("gfx") { 0.790 }
