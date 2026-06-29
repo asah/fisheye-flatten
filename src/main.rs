@@ -103,6 +103,10 @@ struct FlattenArgs {
     /// Output projection: rect or cyl. Auto-selected from focal length.
     #[arg(long)]
     projection: Option<Projection>,
+    /// Limit horizontal field of view (full angle, degrees). Crops the sides so
+    /// `--projection rect` (straight lines) stays a sane size on wide fisheyes.
+    #[arg(long)]
+    hfov: Option<f64>,
     /// Output scale multiplier
     #[arg(short = 's', long, default_value_t = 1.0)]
     scale: f64,
@@ -296,13 +300,18 @@ struct Geom {
 fn build_geom(
     src_cx: f64, src_cy: f64, r_circle: f64, is_circular: bool,
     theta_max: f64, strip_frac: f64, proj: Projection, scale: f64,
+    az_cap: Option<f64>,
 ) -> Geom {
     let f_pix = r_circle / theta_max;
     // Vertical coverage from the strip fraction (equidistant: y_src = f_pix·el).
     let half_h_src = if is_circular { r_circle } else { src_cy };
     let el_max = ((strip_frac * half_h_src) / f_pix).min(theta_max * 0.95);
-    // Horizontal coverage = full circle half-FoV (decoupled from el_max).
-    let az_max = if is_circular { theta_max * 0.98 } else { (src_cx / r_circle) * theta_max };
+    // Horizontal coverage = full circle half-FoV (decoupled from el_max),
+    // optionally capped by --hfov so rectilinear stays a sane size.
+    let mut az_max = if is_circular { theta_max * 0.98 } else { (src_cx / r_circle) * theta_max };
+    if let Some(cap) = az_cap {
+        az_max = az_max.min(cap);
+    }
     // Output center/extent, scaled. `scale` folds into the center so the output
     // stays symmetric at any scale (at scale=1 this equals the unscaled extent).
     let cx_out = (match proj {
@@ -499,8 +508,9 @@ fn resolve(args: &FlattenArgs, scale: f64) -> Resolved {
     } else {
         args.strip_percent
     }).clamp(0.01, 0.99);
+    let az_cap = args.hfov.map(|deg| (deg.to_radians() / 2.0).clamp(0.01, theta_max));
     let g = build_geom(src_cx, src_cy, r_circle, d.is_circular, theta_max, strip_frac,
-                       proj.clone(), scale);
+                       proj.clone(), scale, az_cap);
     Resolved {
         img: d.img, g, focal_mm, crop_factor: d.crop_factor, fl_ff, pitch_mm: d.pitch_mm,
         r_circle, is_circular: d.is_circular, strip_frac, proj,
@@ -653,7 +663,7 @@ fn run_refish(args: &RefishArgs) {
         // fisheye, so a bare round-trip lines up.
         let proj = args.projection.clone().unwrap_or(Projection::Cylindrical);
         // Build the same geometry `flatten` would for a fisheye of this radius.
-        let g = build_geom(r_out, r_out, r_out, true, theta_max, strip_frac, proj.clone(), 1.0);
+        let g = build_geom(r_out, r_out, r_out, true, theta_max, strip_frac, proj.clone(), 1.0, None);
         let (in_cx, in_cy) = (src_cx, src_cy); // the rectilinear input
 
         if args.verbose {

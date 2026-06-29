@@ -35,6 +35,17 @@ fn flatten_strip_accepts_fraction_or_percent() {
 }
 
 #[test]
+fn flatten_hfov_limits_horizontal_coverage() {
+    // A smaller --hfov crops the sides → a narrower rectilinear output.
+    let fish = fixture(FISH);
+    let narrow = tmp("cli_hfov40.jpg");
+    let wide = tmp("cli_hfov80.jpg");
+    run(&["flatten", path(&fish), "-f", "15", "-c", "1", "--projection", "rect", "--hfov", "40", "-o", path(&narrow)]);
+    run(&["flatten", path(&fish), "-f", "15", "-c", "1", "--projection", "rect", "--hfov", "80", "-o", path(&wide)]);
+    assert!(dims(&narrow).0 < dims(&wide).0, "smaller --hfov should be narrower: {} vs {}", dims(&narrow).0, dims(&wide).0);
+}
+
+#[test]
 fn flatten_scale_halves_dimensions() {
     let fish = fixture(FISH);
     let full = tmp("cli_s1.jpg");

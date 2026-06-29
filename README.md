@@ -119,6 +119,7 @@ defish photo.jpg -p 0.5              # 50% strip height
 defish photo.jpg -p 0.5 -s 0.5      # 50% strip, half-resolution output
 defish photo.jpg -q 100             # max-quality JPEG (larger file)
 defish photo.jpg -f 8 -c 0.79       # GFX 100S II at 8mm (override EXIF)
+defish photo.jpg --projection rect --hfov 120   # straight lines over a 120° view
 defish photo.jpg -v                  # print geometry details
 ```
 
@@ -129,6 +130,8 @@ defish photo.jpg -v                  # print geometry details
 | `-p` | `0.50` | Vertical coverage as a fraction (`0.30`) or percent (`30`) — both mean 30% |
 | `-f` | EXIF / auto | Focal length in mm (see auto-detection below) |
 | `-c` | EXIF model | Crop factor vs full-frame (GFX=0.79, Z8=1.0) |
+| `--projection` | auto | `cyl` (wide; verticals straight, horizontals bow) or `rect` (all straight lines, but edges stretch) |
+| `--hfov` | full | Limit horizontal field of view (degrees) so `--projection rect` stays a sane size on wide fisheyes |
 | `--calibrate` | — | Print recommended `--calib-scale` for a shot of known focal length, then exit |
 | `--calib-scale` | `1.0` | Correction factor for the circle→focal-length model |
 | `-s` | `1.0` | Output scale multiplier |
