@@ -198,3 +198,16 @@ cargo build --release
 ```
 
 Requires Rust ≥ 1.75 stable. Uses Rayon for parallel processing.
+
+## Testing
+
+```bash
+cargo test
+```
+
+`testdata/checkerboard.jpg` is a rectilinear checkerboard fixture (center cross +
+colored quadrant dots) for eyeballing `defish` / `refish` / `tunnel` / `animate`.
+The integration test in `tests/roundtrip.rs` runs `refish` then `flatten` on it
+and asserts the recovered central region matches the source in brightness,
+contrast, and the on-axis center cross — i.e. the round-trip returns a similar
+image, minus the cropped/out-of-FoV parts.
