@@ -151,12 +151,20 @@ struct RefishArgs {
     /// Source horizontal field of view in degrees (overrides EXIF-derived)
     #[arg(long)]
     source_fov: Option<f64>,
-    /// Source focal length in mm (normally read from EXIF)
+    /// Focal length in mm. In physical mode this is the EXACT inverse of
+    /// `flatten -f` (same Laowa angle model) — match it to round-trip.
     #[arg(short = 'f', long)]
     focal_length: Option<f64>,
-    /// Source sensor crop factor (auto from EXIF model)
+    /// Sensor crop factor (match flatten's -c for round-trips)
     #[arg(short = 'c', long)]
     crop_factor: Option<f64>,
+    /// Physical mode: vertical coverage, fraction (0.5) or percent (50) — match
+    /// flatten's -p to round-trip.
+    #[arg(short = 'p', long, default_value_t = 0.50)]
+    strip_percent: f64,
+    /// Physical mode: projection to invert — rect or cyl (match flatten's)
+    #[arg(long)]
+    projection: Option<Projection>,
     /// JPEG output quality, 1–100 (ignored for non-JPEG output)
     #[arg(short = 'q', long, default_value_t = 95)]
     quality: u8,
@@ -584,50 +592,65 @@ fn run_refish(args: &RefishArgs) {
     let physical = args.fov.is_some() || args.source_fov.is_some() || args.focal_length.is_some();
 
     let (out_img, description) = if physical {
-        let f_src_pix = if let Some(sfov) = args.source_fov {
-            src_cx / (sfov.to_radians() / 2.0).tan()
+        // Exact analytic inverse of `flatten` (defish_source_coord): same
+        // separable az/el model and shared geometry, so refish→flatten with
+        // matching -f/-c/-p/--projection round-trips (modulo crop/resampling).
+        let crop = args.crop_factor.unwrap_or_else(||
+            read_exif_model(&args.input).map(|m| detect_crop_factor(&m)).unwrap_or(1.0));
+        let theta_max = if let Some(fov) = args.fov {
+            (fov.to_radians() / 2.0).min(89.9_f64.to_radians())
         } else if let Some(focal) = args.focal_length
             .or_else(|| read_exif_focal_length(&args.input).filter(|f| *f > 0.0))
         {
-            let model = read_exif_model(&args.input);
-            let crop = args.crop_factor.unwrap_or_else(||
-                model.as_deref().map(detect_crop_factor).unwrap_or(1.0));
-            let pitch = sensor_pixel_pitch_mm(&args.input, model.as_deref(), crop, src_w);
-            focal / pitch
+            laowa_half_aov_deg((focal * crop).clamp(8.0, 15.0)).to_radians()
+        } else if let Some(sfov) = args.source_fov {
+            (sfov.to_radians() / 2.0).min(89.9_f64.to_radians())
         } else {
-            src_cx / (45.0_f64).to_radians().tan()
+            45.0_f64.to_radians()
         };
-        let src_hfov = (src_cx / f_src_pix).atan();
-        let theta_max = match args.fov {
-            Some(deg) => (deg.to_radians() / 2.0).min(89.9_f64.to_radians()),
-            None => src_hfov,
-        };
-        const THETA_CAP: f64 = 1.569; // ~89.9° — beyond this tan() explodes
+        let strip_frac = (if args.strip_percent > 1.0 {
+            args.strip_percent / 100.0
+        } else {
+            args.strip_percent
+        }).clamp(0.01, 0.99);
+        let proj = args.projection.clone().unwrap_or(Projection::Rectilinear);
+        // Build the same geometry `flatten` would for a fisheye of this radius.
+        let g = build_geom(r_out, r_out, r_out, true, theta_max, strip_frac, proj.clone(), 1.0);
+        let (in_cx, in_cy) = (src_cx, src_cy); // the rectilinear input
+
         if args.verbose {
-            eprintln!("Refish:     physical (gnomonic)  f_src={:.0}px/rad  source_hFoV={:.1}°",
-                f_src_pix, src_hfov.to_degrees() * 2.0);
-            eprintln!("Output:     {0}×{0}px circle  coverage={1:.1}°  q{2}",
-                size, theta_max.to_degrees() * 2.0, args.quality.clamp(1, 100));
+            eprintln!("Refish:     physical (exact inverse of flatten)  theta_max={:.1}°  {:?}",
+                theta_max.to_degrees(), proj);
+            eprintln!("Output:     {0}×{0}px circle  coverage az±{1:.1}° el±{2:.1}°  q{3}",
+                size, g.az_max.to_degrees(), g.el_max.to_degrees(), args.quality.clamp(1, 100));
         }
-        let out = render(size, size, |ox, oy| {
-            let dx = ox as f64 + 0.5 - c_out;
-            let dy = oy as f64 + 0.5 - c_out;
-            let r = (dx * dx + dy * dy).sqrt();
-            if r > r_out { return [0, 0, 0]; }
-            let theta = r / r_out * theta_max;
-            if theta >= THETA_CAP { return [0, 0, 0]; }
-            if r < 1e-9 {
-                return bilinear(img_ref, src_cx, src_cy).unwrap_or([0, 0, 0]);
+        let out = render(size, size, |fx, fy| {
+            let dx = fx as f64 + 0.5 - c_out;
+            let dy = fy as f64 + 0.5 - c_out;
+            let rr = (dx * dx + dy * dy).sqrt();
+            if rr > r_out { return [0, 0, 0]; }
+            if rr < 1e-9 {
+                return bilinear(img_ref, in_cx, in_cy).unwrap_or([0, 0, 0]);
             }
-            let rr = f_src_pix * theta.tan();
-            bilinear(img_ref, src_cx + rr * dx / r, src_cy + rr * dy / r).unwrap_or([0, 0, 0])
+            // fisheye pixel → ray (az, el), inverting defish's mapping exactly.
+            let theta = rr / r_out * g.theta_max;
+            let s = theta.sin();
+            let el = ((dy / rr) * s).clamp(-1.0, 1.0).asin();
+            let az = ((dx / rr) * s).atan2(theta.cos());
+            // ray → normalized rectilinear coords (inverse of defish's az/el).
+            let ox_norm = match proj {
+                Projection::Cylindrical => az / g.az_max,
+                Projection::Rectilinear => az.tan() / g.tan_az_max,
+            };
+            let oy_norm = el.tan() / g.tan_el_max;
+            if ox_norm.abs() > 1.0 || oy_norm.abs() > 1.0 { return [0, 0, 0]; }
+            bilinear(img_ref, in_cx * (1.0 + ox_norm), in_cy * (1.0 + oy_norm)).unwrap_or([0, 0, 0])
         });
         let desc = format!(
-            "refish (fisheye-flatten v{ver}): rectilinear->fisheye (physical), \
-             source_hFoV={shf:.1}deg, output_coverage={cov:.1}deg, size={sz}px, quality={q}, source={src}",
-            ver = env!("CARGO_PKG_VERSION"), shf = src_hfov.to_degrees() * 2.0,
-            cov = theta_max.to_degrees() * 2.0, sz = size,
-            q = args.quality.clamp(1, 100),
+            "refish (fisheye-flatten v{ver}): rectilinear->fisheye (physical inverse), \
+             theta_max={tm:.1}deg, projection={proj:?}, strip={strip:.0}%, size={sz}px, quality={q}, source={src}",
+            ver = env!("CARGO_PKG_VERSION"), tm = theta_max.to_degrees() * 2.0, proj = proj,
+            strip = strip_frac * 100.0, sz = size, q = args.quality.clamp(1, 100),
             src = args.input.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
         );
         (out, desc)

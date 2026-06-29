@@ -8,8 +8,8 @@
 //!   - statistics (brightness + contrast) of the central region match the source
 //!   - the red-vertical / green-horizontal center cross is preserved on-axis
 //!
-//! `refish --fov 130` (±65°) is paired with `flatten -f 10 -c 1` so both use the
-//! same 65° half-angle equidistant model — i.e. they're true inverses.
+//! refish's *physical* mode is the exact analytic inverse of flatten, so the
+//! two round-trip when given matching `-f`/`-c`/`-p`/`--projection`.
 
 mod common;
 use common::*;
@@ -21,16 +21,16 @@ fn refish_then_defish_recovers_similar_image() {
     let fish = tmp("rt_fish.jpg");
     let rec = tmp("rt_rec.jpg");
 
-    // rectilinear → fisheye
+    // rectilinear → fisheye (physical mode: -f triggers it)
     run(&[
         "refish", path(&src_path),
-        "--source-fov", "130", "--fov", "130", "--size", "1024",
+        "-f", "10", "-c", "1", "-p", "80", "--projection", "rect", "--size", "1024",
         "-o", path(&fish),
     ]);
-    // fisheye → rectilinear (same 65° model: -f 10 ↔ --fov 130)
+    // fisheye → rectilinear with the SAME parameters → exact inverse
     run(&[
         "flatten", path(&fish),
-        "--projection", "rect", "-f", "10", "-c", "1", "-p", "60",
+        "-f", "10", "-c", "1", "-p", "80", "--projection", "rect",
         "-o", path(&rec),
     ]);
 

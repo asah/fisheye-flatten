@@ -47,10 +47,17 @@ Two modes:
   `-k/--strength` (0 = a plain circular crop, higher = more bow). It's
   independent of the source's field of view, so **any** image becomes an obvious
   fisheye that fills the disc. This is the "make it look like a fisheye" mode.
-- **Physical** (when you pass `--fov`, `--source-fov`, or `-f`). The faithful
-  rectilinear→equidistant projection. Exact — but it only bends as much as the
-  field of view allows, so a narrow-FoV source barely curves (it looks like a
-  circular crop). Use it to invert a real fisheye (it's `flatten`'s inverse).
+- **Physical** (when you pass `--fov`, `--source-fov`, or `-f`). The **exact
+  analytic inverse of `flatten`** (same separable az/el model). It only bends as
+  much as the field of view allows, so a narrow-FoV source barely curves. Use it
+  to invert a real fisheye — `refish` then `flatten` with the **same**
+  `-f`/`-c`/`-p`/`--projection` reproduces the input (modulo the cropped /
+  out-of-FoV parts):
+
+  ```bash
+  defish refish photo.jpg  -f 10 -c 1 -p 80 --projection rect -o fisheye.jpg
+  defish flatten fisheye.jpg -f 10 -c 1 -p 80 --projection rect -o back.jpg   # ≈ photo.jpg
+  ```
 
 Output is a square; `--size` sets the diameter (default: the shorter source side).
 

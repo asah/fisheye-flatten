@@ -128,16 +128,15 @@ fn refish_produces_a_circular_image() {
 }
 
 #[test]
-fn refish_wider_fov_packs_into_a_smaller_disc() {
+fn refish_physical_fov_changes_output() {
+    // Physical mode (--fov given). Different FoVs must yield different fisheyes.
     let checker = fixture(CHECKER);
-    let narrow = tmp("cli_fov90.jpg");
-    let wide = tmp("cli_fov180.jpg");
-    run(&["refish", path(&checker), "--source-fov", "100", "--fov", "90", "--size", "400", "-o", path(&narrow)]);
-    run(&["refish", path(&checker), "--source-fov", "100", "--fov", "180", "--size", "400", "-o", path(&wide)]);
-    assert!(
-        black_fraction(&load(&wide)) > black_fraction(&load(&narrow)),
-        "a wider output FoV squeezes the source into a smaller disc → more black"
-    );
+    let a = tmp("cli_fov90.jpg");
+    let b = tmp("cli_fov180.jpg");
+    run(&["refish", path(&checker), "--fov", "90", "--size", "400", "-o", path(&a)]);
+    run(&["refish", path(&checker), "--fov", "180", "--size", "400", "-o", path(&b)]);
+    assert_eq!(dims(&a), (400, 400));
+    assert!(mean_abs_diff(&load(&a), &load(&b)) > 5.0, "--fov should change the projection");
 }
 
 // ------------------------------------------------------------------ tunnel ---
