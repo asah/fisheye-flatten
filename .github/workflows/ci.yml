@@ -53,18 +53,36 @@ jobs:
             -o /tmp/out_gfx_12mm.jpg -p 0.3 -f 12 -c 0.79 -v
           test -s /tmp/out_gfx_12mm.jpg
 
-      - name: Smoke — strip percent range
+      - name: Smoke — strip percent (fraction and percentage forms)
         run: |
-          for pct in 0.1 0.3 0.5 0.8; do
+          for pct in 0.1 0.3 0.5 0.8 30; do
             ./target/release/defish tests/test_fisheye.jpg \
               -o /tmp/out_strip${pct}.jpg -p $pct -f 15 -c 1.0
             test -s /tmp/out_strip${pct}.jpg && echo "strip=$pct OK"
           done
+
+      - name: Smoke — refish (rectilinear → fisheye)
+        run: |
+          ./target/release/defish refish testdata/checkerboard.jpg \
+            --source-fov 120 --fov 150 -o /tmp/out_refish.jpg -v
+          test -s /tmp/out_refish.jpg
+
+      - name: Smoke — tunnel (radial warp, both directions)
+        run: |
+          ./target/release/defish tunnel testdata/checkerboard.jpg -k 1.5 -o /tmp/out_tunnel.jpg -v
+          ./target/release/defish tunnel testdata/checkerboard.jpg -k -0.5 -o /tmp/out_bulge.jpg
+          test -s /tmp/out_tunnel.jpg && test -s /tmp/out_bulge.jpg
+
+      - name: Smoke — animate (frame sequence; no ffmpeg needed)
+        run: |
+          ./target/release/defish animate testdata/checkerboard.jpg \
+            -f 8 -c 1.0 --frames --steps 6 --max-width 480 -o /tmp/out_anim.png
+          test -s /tmp/out_anim_0000.png && test -s /tmp/out_anim_0005.png
 
       - name: Upload outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: defish-outputs-${{ matrix.os }}
-          path: /tmp/out_*.jpg
+          path: /tmp/out_*
           retention-days: 7
