@@ -521,11 +521,21 @@ fn run_flatten(args: &FlattenArgs) {
     println!("Saved: {}  ({}×{})", out_path.display(), r.g.out_w, r.g.out_h);
 }
 
-/// Build the default output path `{stem}_{suffix}.{ext}` next to the input.
+/// Build the default output path `{stem}_{suffix}.{ext}` **next to the input**
+/// (preserving its directory), so `defish dir/photo.jpg` writes
+/// `dir/photo_defish.jpg`, not `photo_defish.jpg` in the current directory.
 fn default_output(input: &Path, suffix: &str) -> PathBuf {
     let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-    let ext  = input.extension().unwrap_or_default().to_string_lossy();
-    PathBuf::from(format!("{}_{}.{}", stem, suffix, ext))
+    let ext = input.extension().unwrap_or_default().to_string_lossy();
+    let name = if ext.is_empty() {
+        format!("{}_{}", stem, suffix)
+    } else {
+        format!("{}_{}.{}", stem, suffix, ext)
+    };
+    match input.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    }
 }
 
 /// Embed a settings summary + tool tag in the output JPEG (no-op for non-JPEG).
