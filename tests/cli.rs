@@ -100,6 +100,23 @@ fn calibrate_reports_scale_without_writing_an_image() {
 // ------------------------------------------------------------------ refish ---
 
 #[test]
+fn refish_default_barrel_warps_the_image() {
+    // Default (no FoV flags) is the fill-the-frame barrel: -k 0 is a plain
+    // circular crop, higher strengths bend the image. They must differ.
+    let checker = fixture(CHECKER);
+    let crop = tmp("cli_refish_k0.jpg");
+    let warp = tmp("cli_refish_k2.jpg");
+    run(&["refish", path(&checker), "-k", "0", "--size", "400", "-o", path(&crop)]);
+    run(&["refish", path(&checker), "-k", "2", "--size", "400", "-o", path(&warp)]);
+    assert_eq!(dims(&crop), (400, 400));
+    assert_eq!(dims(&warp), (400, 400));
+    assert!(
+        mean_abs_diff(&load(&crop), &load(&warp)) > 5.0,
+        "barrel --strength should visibly warp vs a plain crop"
+    );
+}
+
+#[test]
 fn refish_produces_a_circular_image() {
     let checker = fixture(CHECKER);
     let circ = tmp("cli_refish.jpg");

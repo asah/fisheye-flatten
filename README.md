@@ -35,16 +35,24 @@ All subcommands share one remap engine and lens model (`src/lib.rs`).
 ### refish — make a photo look like a fisheye
 
 ```bash
-defish refish photo.jpg                  # fill the circle with the source's own FoV
-defish refish photo.jpg --fov 180        # exaggerate to a 180° fisheye look
-defish refish photo.jpg --source-fov 75  # source lacks usable EXIF
+defish refish photo.jpg                  # fisheye that fills the frame (barrel, -k 1)
+defish refish photo.jpg -k 2.5           # stronger curvature
+defish refish photo.jpg --fov 150        # physical 150° projection (to invert a real fisheye)
+defish refish photo.jpg --source-fov 75  # physical; source lacks usable EXIF
 ```
 
-Straight lines bow outward and the frame wraps into a disc (black outside the
-circle). You can only render the field of view the source actually contains — a
-70° photo fills the circle to 70°, with black beyond. The source FoV comes from
-EXIF focal length + body, or `--source-fov`. Output is a square; `--size` sets
-the diameter (default: the shorter source side).
+Two modes:
+
+- **Barrel (default).** A fill-the-frame fisheye whose curvature is set by
+  `-k/--strength` (0 = a plain circular crop, higher = more bow). It's
+  independent of the source's field of view, so **any** image becomes an obvious
+  fisheye that fills the disc. This is the "make it look like a fisheye" mode.
+- **Physical** (when you pass `--fov`, `--source-fov`, or `-f`). The faithful
+  rectilinear→equidistant projection. Exact — but it only bends as much as the
+  field of view allows, so a narrow-FoV source barely curves (it looks like a
+  circular crop). Use it to invert a real fisheye (it's `flatten`'s inverse).
+
+Output is a square; `--size` sets the diameter (default: the shorter source side).
 
 ### tunnel — center recedes, edges magnify
 

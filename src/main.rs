@@ -120,20 +120,27 @@ struct FlattenArgs {
 
 #[derive(Args, Debug)]
 #[command(long_about = "\
-Project a rectilinear (normal) photo into a circular fisheye — the inverse of \
-flatten. Straight lines bow outward and the frame is wrapped into a disc.\n\n\
-You can only render the field of view the source actually contains: a 70° photo \
-fills the circle out to 70°, with black beyond. The source FoV is taken from \
-EXIF focal length + body, or set it directly with --source-fov.\n\n\
+Turn a normal (rectilinear) photo into a circular fisheye — straight lines bow \
+outward and the frame wraps into a disc.\n\n\
+Default: a fill-the-frame barrel whose curvature is set by --strength, so ANY \
+image becomes an obvious fisheye regardless of its field of view.\n\n\
+Physical mode (give --fov, --source-fov, or -f) instead does the faithful \
+rectilinear→equidistant projection — exact, but a narrow-FoV source barely \
+bends (it looks like a circular crop). Use this to invert a real fisheye.\n\n\
 Examples:\n  \
-  defish refish photo.jpg                  # fill the circle with the source FoV\n  \
-  defish refish photo.jpg --fov 180        # exaggerate to a 180° fisheye look\n  \
-  defish refish photo.jpg --source-fov 75  # source has no usable EXIF"
+  defish refish photo.jpg                  # fisheye, fills the frame (strength 1)\n  \
+  defish refish photo.jpg -k 2             # stronger curvature\n  \
+  defish refish photo.jpg --fov 150        # physical 150° projection\n  \
+  defish refish photo.jpg --source-fov 75  # physical, source has no EXIF"
 )]
 struct RefishArgs {
     input: PathBuf,
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Barrel curvature for the default mode: 0 = none (circular crop), higher =
+    /// more fisheye. Ignored in physical mode (--fov/--source-fov/-f).
+    #[arg(short = 'k', long, default_value_t = 1.0)]
+    strength: f64,
     /// Output fisheye diameter in pixels (default: shorter source side)
     #[arg(long)]
     size: Option<u32>,
@@ -561,75 +568,106 @@ fn run_refish(args: &RefishArgs) {
     let (src_w, src_h) = img.dimensions();
     let src_cx = src_w as f64 / 2.0;
     let src_cy = src_h as f64 / 2.0;
-
-    // Source focal length in pixels (f_src): tells us the source's field of view.
-    //   --source-fov wins; else EXIF/flag focal + body pixel pitch; else assume 90°.
-    let f_src_pix = if let Some(sfov) = args.source_fov {
-        src_cx / (sfov.to_radians() / 2.0).tan()
-    } else if let Some(focal) = args.focal_length
-        .or_else(|| read_exif_focal_length(&args.input).filter(|f| *f > 0.0))
-    {
-        let model = read_exif_model(&args.input);
-        let crop = args.crop_factor.unwrap_or_else(||
-            model.as_deref().map(detect_crop_factor).unwrap_or(1.0));
-        let pitch = sensor_pixel_pitch_mm(&args.input, model.as_deref(), crop, src_w);
-        focal / pitch // f in pixels = focal_mm / pitch_mm
-    } else {
-        eprintln!("No source FoV or EXIF focal length; assuming 90° horizontal FoV. \
-                   Set --source-fov.");
-        src_cx / (45.0_f64).to_radians().tan()
-    };
-
-    // Output fisheye angular radius. Default: fill the circle with the source's
-    // own horizontal half-FoV (adds barrel distortion without inventing FoV).
-    let src_hfov = (src_cx / f_src_pix).atan();
-    let theta_max = match args.fov {
-        Some(deg) => (deg.to_radians() / 2.0).min(89.9_f64.to_radians()),
-        None => src_hfov,
-    };
-
     let size = args.size.unwrap_or_else(|| src_w.min(src_h)).max(1);
     let r_out = size as f64 / 2.0;
     let c_out = r_out; // center of the square output
-    const THETA_CAP: f64 = 1.569; // ~89.9° — beyond this tan() explodes / no rectilinear source
-
-    if args.verbose {
-        eprintln!("Source:     {}×{}px  f_src={:.0}px/rad  hFoV={:.1}°",
-            src_w, src_h, f_src_pix, src_hfov.to_degrees() * 2.0);
-        eprintln!("Output:     {0}×{0}px circle  coverage={1:.1}° (±{2:.1}°)  q{3}",
-            size, theta_max.to_degrees() * 2.0, theta_max.to_degrees(), args.quality.clamp(1, 100));
-    }
-
     let img_ref = &img;
-    let out_img = render(size, size, |ox, oy| {
-        let dx = ox as f64 + 0.5 - c_out;
-        let dy = oy as f64 + 0.5 - c_out;
-        let r = (dx * dx + dy * dy).sqrt();
-        if r > r_out { return [0, 0, 0]; }           // outside the image circle
-        let theta = r / r_out * theta_max;           // equidistant: r ∝ θ
-        if theta >= THETA_CAP { return [0, 0, 0]; }
-        if r < 1e-9 {
-            return bilinear(img_ref, src_cx, src_cy).unwrap_or([0, 0, 0]);
+
+    // Two modes:
+    //   * Physical (gnomonic): faithful rectilinear→equidistant projection. Used
+    //     when the geometry is given (--fov / --source-fov / -f), e.g. to invert
+    //     a real fisheye. The warp it produces is only as strong as the field of
+    //     view, so a narrow source barely bends — it looks like a circular crop.
+    //   * Barrel (default): a fill-the-frame fisheye whose curvature is set by
+    //     --strength, independent of the source's field of view, so ANY image
+    //     turns into an obvious fisheye that fills the circle.
+    let physical = args.fov.is_some() || args.source_fov.is_some() || args.focal_length.is_some();
+
+    let (out_img, description) = if physical {
+        let f_src_pix = if let Some(sfov) = args.source_fov {
+            src_cx / (sfov.to_radians() / 2.0).tan()
+        } else if let Some(focal) = args.focal_length
+            .or_else(|| read_exif_focal_length(&args.input).filter(|f| *f > 0.0))
+        {
+            let model = read_exif_model(&args.input);
+            let crop = args.crop_factor.unwrap_or_else(||
+                model.as_deref().map(detect_crop_factor).unwrap_or(1.0));
+            let pitch = sensor_pixel_pitch_mm(&args.input, model.as_deref(), crop, src_w);
+            focal / pitch
+        } else {
+            src_cx / (45.0_f64).to_radians().tan()
+        };
+        let src_hfov = (src_cx / f_src_pix).atan();
+        let theta_max = match args.fov {
+            Some(deg) => (deg.to_radians() / 2.0).min(89.9_f64.to_radians()),
+            None => src_hfov,
+        };
+        const THETA_CAP: f64 = 1.569; // ~89.9° — beyond this tan() explodes
+        if args.verbose {
+            eprintln!("Refish:     physical (gnomonic)  f_src={:.0}px/rad  source_hFoV={:.1}°",
+                f_src_pix, src_hfov.to_degrees() * 2.0);
+            eprintln!("Output:     {0}×{0}px circle  coverage={1:.1}°  q{2}",
+                size, theta_max.to_degrees() * 2.0, args.quality.clamp(1, 100));
         }
-        // Gnomonic projection of the ray (θ, φ) onto the source plane.
-        let rr = f_src_pix * theta.tan();
-        let x_src = src_cx + rr * dx / r;
-        let y_src = src_cy + rr * dy / r;
-        bilinear(img_ref, x_src, y_src).unwrap_or([0, 0, 0])
-    });
+        let out = render(size, size, |ox, oy| {
+            let dx = ox as f64 + 0.5 - c_out;
+            let dy = oy as f64 + 0.5 - c_out;
+            let r = (dx * dx + dy * dy).sqrt();
+            if r > r_out { return [0, 0, 0]; }
+            let theta = r / r_out * theta_max;
+            if theta >= THETA_CAP { return [0, 0, 0]; }
+            if r < 1e-9 {
+                return bilinear(img_ref, src_cx, src_cy).unwrap_or([0, 0, 0]);
+            }
+            let rr = f_src_pix * theta.tan();
+            bilinear(img_ref, src_cx + rr * dx / r, src_cy + rr * dy / r).unwrap_or([0, 0, 0])
+        });
+        let desc = format!(
+            "refish (fisheye-flatten v{ver}): rectilinear->fisheye (physical), \
+             source_hFoV={shf:.1}deg, output_coverage={cov:.1}deg, size={sz}px, quality={q}, source={src}",
+            ver = env!("CARGO_PKG_VERSION"), shf = src_hfov.to_degrees() * 2.0,
+            cov = theta_max.to_degrees() * 2.0, sz = size,
+            q = args.quality.clamp(1, 100),
+            src = args.input.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        );
+        (out, desc)
+    } else {
+        // Fill-the-frame barrel: normalized radius ρ∈[0,1] (ρ=1 at the circle
+        // edge → source edge, so it fills). r_src/r_out = ρ^(strength), pulling
+        // pixels toward the center to magnify it — straight lines bow outward.
+        let strength = args.strength.max(0.0);
+        let p = 1.0 + strength;
+        if args.verbose {
+            eprintln!("Refish:     {0}×{0}px circle  barrel strength={1:.2} (fills frame, FoV-independent)",
+                size, strength);
+        }
+        let out = render(size, size, |ox, oy| {
+            let dx = ox as f64 + 0.5 - c_out;
+            let dy = oy as f64 + 0.5 - c_out;
+            let r = (dx * dx + dy * dy).sqrt();
+            if r > r_out { return [0, 0, 0]; }
+            if r < 1e-9 {
+                return bilinear(img_ref, src_cx, src_cy).unwrap_or([0, 0, 0]);
+            }
+            let scale = (r / r_out).powf(p - 1.0);
+            let x_src = src_cx + (dx / r_out) * scale * src_cx;
+            let y_src = src_cy + (dy / r_out) * scale * src_cy;
+            bilinear(img_ref, x_src, y_src).unwrap_or([0, 0, 0])
+        });
+        let desc = format!(
+            "refish (fisheye-flatten v{ver}): rectilinear->fisheye (barrel), strength={s}, \
+             size={sz}px, quality={q}, source={src}",
+            ver = env!("CARGO_PKG_VERSION"), s = strength, sz = size,
+            q = args.quality.clamp(1, 100),
+            src = args.input.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        );
+        (out, desc)
+    };
 
     let out_path = args.output.clone().unwrap_or_else(|| default_output(&args.input, "refish"));
     save_image(&out_img, &out_path, args.quality).unwrap_or_else(|e| {
         eprintln!("Cannot save: {e}"); std::process::exit(1);
     });
-
-    let src_name = args.input.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let description = format!(
-        "refish (fisheye-flatten v{ver}): rectilinear->fisheye, source_hFoV={shf:.1}deg, \
-         output_coverage={cov:.1}deg, size={sz}px, quality={q}, source={src}",
-        ver = env!("CARGO_PKG_VERSION"), shf = src_hfov.to_degrees() * 2.0,
-        cov = theta_max.to_degrees() * 2.0, sz = size, q = args.quality.clamp(1, 100), src = src_name,
-    );
     embed_exif(&out_path, &description, args.verbose);
     println!("Saved: {}  ({sz}×{sz})", out_path.display(), sz = size);
 }
